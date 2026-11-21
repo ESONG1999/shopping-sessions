@@ -20,7 +20,7 @@ func TestCompactCandidatePreservesActivityAndIngestOrder(t *testing.T) {
 		{253_402_300_799_000, activity{ts: start + 101, cents: 76, category: 65536}},
 	} {
 		input.add(0, 1, tc.ingest, 1, tc.row)
-		got := input.byKey[0][1].rows[0][i]
+		got := input.byKey[0].buckets[1].rows[0][i]
 		if decoded := input.activity(got); decoded != tc.row {
 			t.Fatalf("candidate %d: got %#v, want %#v", i, decoded, tc.row)
 		}
@@ -32,12 +32,12 @@ func TestCompactCandidatePreservesActivityAndIngestOrder(t *testing.T) {
 	}
 }
 
-func TestDedupKeepsDistinctIDsWithTheSameCounter(t *testing.T) {
+func TestDedupKeepsDistinctIDsWithTheSameHashSlot(t *testing.T) {
 	input := candidateInput{
 		byKey: make([]partition[candidate], 1),
 		wide:  make([][]activity, 1),
 	}
-	// These keys share the same two-bit counter and fingerprint.
+	// These keys start in the same slot but differ as complete IDs.
 	const one = uint64(1)
 	const two = one | 1<<40
 	const three = one | 2<<40
@@ -48,7 +48,7 @@ func TestDedupKeepsDistinctIDsWithTheSameCounter(t *testing.T) {
 	input.add(0, three, 1000, 3, activity{ts: 3})
 	out := deduplicate(input, 1, aliases{})
 	got := make(map[uint64]int64)
-	for _, bucket := range out[0] {
+	for _, bucket := range out[0].buckets {
 		for _, block := range bucket.rows {
 			for _, row := range block {
 				person := unmix(row.person)

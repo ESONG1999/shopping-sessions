@@ -28,20 +28,23 @@ The official checkers passed all 36 fixtures and matched both Parquet schemas an
 
 ## Local benchmark
 
-Both images ran with eight pinned vCPUs and the same read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The 20-million-event result is the median of three interleaved trials per image. The 60-million-event result is from one paired trial with warm inputs and the same output volume.
+Both images ran with eight pinned vCPUs, a 24 GiB container limit, no swap, and read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The warm result is the median of three interleaved runs per image. Cold results are the medians of two paired runs after requesting eviction of the input files from the guest page cache.
 
-| Seed | Events | Clicks | Previous wall time (`a91a9fc`) | Optimized wall time | Optimized peak RSS |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 22 | 20 million | 5 million | 2.00 s | 1.87 s | 2.24 GiB |
-| 42 | 60 million | 15 million | 8.51 s | 6.55 s | 6.83 GiB |
+| Seed | Events | Clicks | Cache | Previous wall time (`b00ed9f`) | Optimized wall time | Optimized cgroup peak |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 22 | 20 million | 5 million | Warm | 2.16 s | 2.02 s | 1.66 GiB |
+| 22 | 20 million | 5 million | Cold | 3.08 s | 1.97 s | 3.36 GiB |
+| 42 | 60 million | 15 million | Cold | 15.06 s | 9.99 s | 9.86 GiB |
 
-Both Parquet tables matched the previous version row for row on each dataset.
+Both Parquet tables matched the previous version row for row on each dataset. On the full cold input the optimized image averaged about seven CPU cores. The cgroup charged about 5.41 GiB of file cache, with no memory-limit events. In a separate cold experiment, retaining a second copy of the CSV in anonymous memory increased peak usage from 11.00 to 15.19 GiB and wall time from 10.98 to 16.04 s.
+
+The full run wrote about 62 MiB of Parquet with zero scratch-file bytes and an observed peak of 11 Linux tasks. The public dev run wrote zero bytes to stdout. The final image was about 10.6 MB, and a local rebuild with the base image and dependencies cached took about 8.5 s.
 
 ## Pipeline
 
-- Workers scan newline-aligned chunks with an AVX2 delimiter scanner on supported CPUs and a portable word-at-a-time scanner elsewhere. They validate quote placement once per record and cache validated calendar prefixes. Union-find builds the identity lookup table while the event scan runs. A Bloom filter screens for noncanonical IDs before exact lookup.
-- Workers partition 32-byte event candidates by exact ID. Wide timestamps and large category IDs use a separate payload. Two-bit counters identify hashed positions that need exact deduplication. The earliest copy wins, including when that copy fails validation. Click scanning overlaps this stage.
-- Counting and prefix sums group surviving rows by person. Workers reuse the canonical key for the hash table lookup, then use the same column to store the dense index for scatter. They sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks the crediting click and distinct assisting campaigns.
+- Workers align input chunks to newline boundaries in parallel and scan delimiters with AVX2 where supported. Union-find builds the identity lookup table while the event scan runs. Click parsing starts as soon as that table is ready.
+- Workers store 32-byte event candidates in per-worker slabs and partition by exact ID. A sparse exact hash table trades extra index space for shorter probes. The earliest copy wins, including when that copy fails validation.
+- Counting and prefix sums group surviving rows by person. Workers reuse scatter buffers and schedule larger buckets first. They sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks the crediting click and distinct assisting campaigns.
 - Each worker streams user-day rows into Parquet. Campaign-day totals are merged across the workers.
 
 Production dependencies provide Parquet serialization and read-only memory mapping. [parquet-go](https://github.com/parquet-go/parquet-go) · [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)

@@ -1,15 +1,16 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	parquet "github.com/parquet-go/parquet-go"
@@ -139,10 +140,24 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 		}
 	}
 	failures := make([]error, workers)
-	parallel(workers, bucketCount, func(worker, bucket int) {
+	type bucketJob struct {
+		bucket, rows int
+	}
+	var jobs [bucketCount]bucketJob
+	for bucket := range jobs {
+		jobs[bucket].bucket = bucket
+		for worker := range events {
+			jobs[bucket].rows += events[worker].buckets[bucket].size + clicks[worker].buckets[bucket].size
+		}
+	}
+	// Schedule large buckets first to keep long user histories from
+	// becoming the only work left on a single worker.
+	slices.SortFunc(jobs[:], func(a, b bucketJob) int { return cmp.Compare(b.rows, a.rows) })
+	parallel(workers, bucketCount, func(worker, job int) {
 		if failures[worker] != nil {
 			return
 		}
+		bucket := jobs[job].bucket
 		ev := takeBlocks(events, bucket)
 		cl := takeBlocks(clicks, bucket)
 		failures[worker] = states[worker].process(ev, cl)
@@ -208,28 +223,27 @@ func run(data, out string, workers int) error {
 	ids := &identities{}
 	var a aliases
 	var aliasErr error
-	var pending sync.WaitGroup
-	pending.Add(1)
+	var cl []partition[click]
+	var clickErr error
+	aliasesReady, clicksDone := make(chan struct{}), make(chan struct{})
 	go func() {
-		defer pending.Done()
+		defer close(clicksDone)
 		a, aliasErr = readAliases(filepath.Join(data, "links"), workers, ids)
+		close(aliasesReady)
+		if aliasErr == nil {
+			cl, clickErr = readClicks(filepath.Join(data, "clicks"), workers, w, ids, a, c)
+		}
 	}()
 	raw, err := readEventCandidates(filepath.Join(data, "events"), workers, w, ids, c)
-	pending.Wait()
+	<-aliasesReady
 	if err := errors.Join(err, aliasErr); err != nil {
+		<-clicksDone
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "catalogs, links and event scan: %v\n", time.Since(started).Round(time.Millisecond))
 	stage := time.Now()
-	var cl []partition[click]
-	var clickErr error
-	pending.Add(1)
-	go func() {
-		defer pending.Done()
-		cl, clickErr = readClicks(filepath.Join(data, "clicks"), workers, w, ids, a, c)
-	}()
 	ev := deduplicate(raw, workers, a)
-	pending.Wait()
+	<-clicksDone
 	if clickErr != nil {
 		return clickErr
 	}

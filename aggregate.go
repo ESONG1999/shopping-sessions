@@ -145,6 +145,9 @@ type aggregator struct {
 	touched     []uint32
 	timeScratch []activity
 	personIndex aliasTable
+	spans       []personSpan
+	eventRows   []activity
+	clickRows   []touchpoint
 	ads         attribution
 }
 
@@ -159,7 +162,7 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	}
 	// Count both inputs by person. After the prefix sums, the same fields
 	// act as write cursors into compact, contiguous spans.
-	spans := []personSpan{{}}
+	spans := append(agg.spans[:0], personSpan{})
 	size := 1 << bits.Len(uint(max(31, events.size/16)))
 	if cap(agg.personIndex) < size {
 		agg.personIndex = make(aliasTable, size)
@@ -198,14 +201,22 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 		}
 	}
 	agg.personIndex = index
+	agg.spans = spans
 	eventCount, clickCount := 0, 0
 	for i := 1; i < len(spans); i++ {
 		span := &spans[i]
 		span.events, eventCount = eventCount, eventCount+span.events
 		span.clicks, clickCount = clickCount, clickCount+span.clicks
 	}
-	eventRows := make([]activity, eventCount)
-	clickRows := make([]touchpoint, clickCount)
+	if cap(agg.eventRows) < eventCount {
+		agg.eventRows = make([]activity, eventCount)
+	}
+	if cap(agg.clickRows) < clickCount {
+		agg.clickRows = make([]touchpoint, clickCount)
+	}
+	// The scatter pass fills every position, so reused rows need no clearing.
+	eventRows := agg.eventRows[:eventCount]
+	clickRows := agg.clickRows[:clickCount]
 	for _, block := range events.rows {
 		for _, row := range block {
 			span := &spans[row.person]

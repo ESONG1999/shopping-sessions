@@ -130,7 +130,7 @@ func scanPaths(paths []string, workers, width int, visit func(int, []string)) er
 			unix.Munmap(data)
 		}
 	}()
-	var jobs []string
+	var jobs []inputChunk
 	for _, path := range paths {
 		data, err := mapFile(path)
 		if err != nil {
@@ -141,26 +141,46 @@ func scanPaths(paths []string, workers, width int, visit func(int, []string)) er
 		}
 		mappings = append(mappings, data)
 		text := unsafe.String(&data[0], len(data))
-		_, text, _ = strings.Cut(text, "\n")
-		for len(text) > chunkBytes {
-			next := strings.IndexByte(text[chunkBytes:], '\n')
-			if next < 0 {
-				break
-			}
-			end := chunkBytes + next + 1
-			jobs = append(jobs, text[:end])
-			text = text[end:]
-		}
-		if text != "" {
-			jobs = append(jobs, text)
+		for start := 0; start < len(text); start += chunkBytes {
+			jobs = append(jobs, inputChunk{text, start, min(start+chunkBytes, len(text))})
 		}
 	}
 	parallel(workers, len(jobs), func(worker, job int) {
-		scanCSV(jobs[job], width, func(record []string) {
+		scanCSV(jobs[job].records(), width, func(record []string) {
 			visit(worker, record)
 		})
 	})
 	return nil
+}
+
+type inputChunk struct {
+	text       string
+	start, end int
+}
+
+func (c inputChunk) records() string {
+	text, start, end := c.text, c.start, c.end
+	// A chunk owns records whose start falls inside its original byte range.
+	// Resolve both boundaries on the worker so cold page faults run in parallel.
+	if start == 0 || text[start-1] != '\n' {
+		next := strings.IndexByte(text[start:end], '\n')
+		if next < 0 {
+			return ""
+		}
+		start += next + 1
+	}
+	if start == end {
+		return ""
+	}
+	if end < len(text) && text[end-1] != '\n' {
+		next := strings.IndexByte(text[end:], '\n')
+		if next < 0 {
+			end = len(text)
+		} else {
+			end += next + 1
+		}
+	}
+	return text[start:end]
 }
 
 func parallel(workers, count int, run func(worker, job int)) {

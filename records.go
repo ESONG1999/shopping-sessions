@@ -8,6 +8,7 @@ const (
 	bucketBits  = 7
 	bucketCount = 1 << bucketBits
 	blockSize   = 2048
+	slabBlocks  = 32
 )
 
 // Fixed-size blocks let workers partition rows without slice growth copying
@@ -17,22 +18,30 @@ type blocks[T any] struct {
 	size int
 }
 
-func (b *blocks[T]) add(row T) {
+type partition[T any] struct {
+	buckets [bucketCount]blocks[T]
+	spare   []T
+}
+
+func (p *partition[T]) add(bucket uint64, row T) {
+	b := &p.buckets[bucket]
 	i := len(b.rows) - 1
 	if i < 0 || len(b.rows[i]) == blockSize {
-		b.rows = append(b.rows, make([]T, 0, blockSize))
+		if len(p.spare) == 0 {
+			p.spare = make([]T, slabBlocks*blockSize)
+		}
+		b.rows = append(b.rows, p.spare[:0:blockSize])
+		p.spare = p.spare[blockSize:]
 		i++
 	}
 	b.rows[i] = append(b.rows[i], row)
 	b.size++
 }
 
-type partition[T any] [bucketCount]blocks[T]
-
 func takeBlocks[T any](workers []partition[T], bucket int) blocks[T] {
 	var result blocks[T]
 	for i := range workers {
-		b := &workers[i][bucket]
+		b := &workers[i].buckets[bucket]
 		result.rows = append(result.rows, b.rows...)
 		result.size += b.size
 		*b = blocks[T]{}
@@ -104,7 +113,7 @@ func (in *candidateInput) add(worker int, key uint64, ingest int64, user uint64,
 			in.wide[worker] = append(in.wide[worker], e)
 		}
 	}
-	in.byKey[worker][key&(bucketCount-1)].add(row)
+	in.byKey[worker].add(key&(bucketCount-1), row)
 }
 
 func (row candidate) ingestOrder() uint64 {
@@ -190,8 +199,8 @@ func deduplicate(raw candidateInput, workers int, a aliases) []partition[event] 
 }
 
 type dedupScratch struct {
-	counters []uint64
-	slots    []uint64
+	refs  []uint32
+	slots []uint64
 }
 
 func clearWords(values []uint64, size int) []uint64 {
@@ -207,71 +216,45 @@ func (s *dedupScratch) dedup(input blocks[candidate], raw candidateInput, a alia
 	if input.size == 0 {
 		return
 	}
-	// A two-bit counter records whether each hashed position was seen once
-	// or multiple times. A singleton cannot have an equal candidate.
-	words := 1 << bits.Len(uint((input.size-1)/2))
-	s.counters = clearWords(s.counters, words)
-	mask := uint64(words - 1)
-	suspects := 0
-	for _, block := range input.rows {
-		for _, row := range block {
-			hash := row.key >> bucketBits
-			index := (hash >> 5) & mask
-			seen := uint64(1) << ((hash & 31) << 1)
-			state := s.counters[index]
-			if state&seen == 0 {
-				s.counters[index] = state | seen
-			} else {
-				repeated := seen << 1
-				if state&repeated == 0 {
-					s.counters[index] = state | repeated
-					suspects++
-				}
-				suspects++
-			}
-		}
-	}
-
-	// A collision in the counters goes through exact deduplication. Use
-	// different hash bits for placement so counter collisions spread out.
-	capacity := 1 << bits.Len(uint(suspects*3/2))
+	// Keep load below 25% to avoid long probes. The row reference is in
+	// a separate array, so unrelated keys only touch the key table.
+	capacity := 1 << bits.Len(uint(4*input.size-1))
 	s.slots = clearWords(s.slots, capacity)
+	if cap(s.refs) < capacity {
+		s.refs = make([]uint32, capacity)
+	}
+	refs := s.refs[:capacity]
+	mask := capacity - 1
 	for blockNo, block := range input.rows {
-		for i, row := range block {
-			hash := row.key >> bucketBits
-			index := (hash >> 5) & mask
-			repeated := uint64(2) << ((hash & 31) << 1)
-			if s.counters[index]&repeated == 0 {
-				emitWinner(row, raw, a, output)
-				continue
-			}
-			ref := uint64(blockNo*blockSize + i + 1)
-			fingerprint := row.key << 32
-			slot := int(row.key>>32) & (capacity - 1)
+		for i := range block {
+			row := &block[i]
+			ref := uint32(blockNo*blockSize + i)
+			slot := int(row.key>>bucketBits) & mask
 			for {
-				old := s.slots[slot]
-				if old == 0 {
-					s.slots[slot] = fingerprint | ref
+				previous := s.slots[slot]
+				if previous == 0 {
+					s.slots[slot] = row.key
+					refs[slot] = ref
 					break
 				}
-				if old&0xffffffff00000000 == fingerprint {
-					index := uint32(old) - 1
-					previous := input.rows[index/blockSize][index%blockSize]
-					if row.key == previous.key {
-						if row.ingestOrder() < previous.ingestOrder() {
-							s.slots[slot] = fingerprint | ref
-						}
-						break
+				if previous == row.key {
+					old := refs[slot]
+					earlier := &input.rows[old/blockSize][old%blockSize]
+					if row.ingestOrder() < earlier.ingestOrder() {
+						refs[slot] = ref
+						earlier.person = 0
+					} else {
+						row.person = 0
 					}
+					break
 				}
-				slot = (slot + 1) & (capacity - 1)
+				slot = (slot + 1) & mask
 			}
 		}
 	}
-	for _, slot := range s.slots {
-		if slot != 0 {
-			index := uint32(slot) - 1
-			emitWinner(input.rows[index/blockSize][index%blockSize], raw, a, output)
+	for _, block := range input.rows {
+		for _, row := range block {
+			emitWinner(row, raw, a, output)
 		}
 	}
 }
@@ -279,7 +262,7 @@ func (s *dedupScratch) dedup(input blocks[candidate], raw candidateInput, a alia
 func emitWinner(row candidate, raw candidateInput, a aliases, output *partition[event]) {
 	if row.person != 0 {
 		person := a.personHash(row.person)
-		output[person&(bucketCount-1)].add(event{person, raw.activity(row)})
+		output.add(person&(bucketCount-1), event{person, raw.activity(row)})
 	}
 }
 
@@ -296,7 +279,7 @@ func readClicks(dir string, workers int, w window, ids *identities, a aliases, c
 			return
 		}
 		person := a.personHash(ids.key(f[1]))
-		result[worker][person&(bucketCount-1)].add(click{person, touchpoint{ts, ids.key(f[0]), campaign}})
+		result[worker].add(person&(bucketCount-1), click{person, touchpoint{ts, ids.key(f[0]), campaign}})
 	})
 	return result, err
 }
