@@ -15,10 +15,10 @@ type csvMask struct {
 
 func scanCSV(text string, width int, visit func([]string)) {
 	var values [7]string
+	var ends [7]int
 	record := values[:width]
 	var masks [128]csvMask
-	start, column, carriedQuotes := 0, 0, 0
-	malformed := false
+	start, column, rowQuotes := 0, 0, 0
 
 	for offset := 0; offset <= len(text); {
 		wholeBlocks := min(len(masks), (len(text)-offset)/csvBlock)
@@ -36,38 +36,65 @@ func scanCSV(text string, width int, visit func([]string)) {
 			n = 1
 		}
 		for _, mask := range masks[:n] {
-			separators, quotes := mask.separators, mask.quotes
-			for separators != 0 {
-				bit := separators & -separators
-				seenQuotes := quotes & (bit - 1)
-				end := offset + bits.TrailingZeros32(separators)
-				if column < width {
-					value := text[start:end]
-					if count := carriedQuotes + bits.OnesCount32(seenQuotes); count != 0 {
-						if count == 2 && value[0] == '"' && value[len(value)-1] == '"' {
-							value = value[1 : len(value)-1]
-						} else {
-							malformed = true
-						}
-					}
-					record[column] = value
-				}
-				column++
-				start = end + 1
-				if mask.newlines&bit != 0 {
-					if column == width && !malformed {
+			commas, quotes := mask.separators&^mask.newlines, mask.quotes
+			for newlines := mask.newlines; newlines != 0; newlines &= newlines - 1 {
+				newline := newlines & -newlines
+				below := newline - 1
+				end := offset + bits.TrailingZeros32(newlines)
+				fields := commas & below
+				if column+bits.OnesCount32(fields) == width-1 {
+					csvFieldEnds(ends[column:width-1], offset, fields)
+					ends[width-1] = end
+					rowQuotes += bits.OnesCount32(quotes & below)
+					if decodeCSVRecord(text, start, ends[:width], record, rowQuotes) {
 						visit(record)
 					}
-					column, malformed = 0, false
 				}
-				separators -= bit
-				quotes ^= seenQuotes
-				carriedQuotes = 0
+				commas &^= below
+				quotes &^= below
+				start, column, rowQuotes = end+1, 0, 0
 			}
-			carriedQuotes += bits.OnesCount32(quotes)
+			if commas != 0 {
+				last := column + bits.OnesCount32(commas)
+				if last < width {
+					csvFieldEnds(ends[column:last], offset, commas)
+				}
+				column = min(last, width)
+			}
+			rowQuotes += bits.OnesCount32(quotes)
 			offset += csvBlock
 		}
 	}
+}
+
+func csvFieldEnds(ends []int, offset int, commas uint32) {
+	for i := range ends {
+		ends[i] = offset + bits.TrailingZeros32(commas)
+		commas &= commas - 1
+	}
+}
+
+func decodeCSVRecord(text string, start int, ends []int, record []string, quotes int) bool {
+	if quotes == 0 {
+		for i, end := range ends {
+			record[i] = text[start:end]
+			start = end + 1
+		}
+		return true
+	}
+	// Each wrapped field accounts for exactly two known quote bytes.
+	// Any unmatched quote must be outside the permitted wrapper positions.
+	wrapped := 0
+	for i, end := range ends {
+		value := text[start:end]
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			value = value[1 : len(value)-1]
+			wrapped++
+		}
+		record[i] = value
+		start = end + 1
+	}
+	return quotes == 2*wrapped
 }
 
 func tailCSVMask(text string) csvMask {

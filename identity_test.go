@@ -29,3 +29,13 @@ func TestIdentityPacking(t *testing.T) {
 		}
 	}
 }
+
+func TestMixedIdentityRoundTrip(t *testing.T) {
+	random := rand.New(rand.NewPCG(81, 36))
+	for i := 0; i < 8192; i++ {
+		key := random.Uint64()
+		if got := unmix(mix(key)); got != key {
+			t.Fatalf("round trip for %016x returned %016x", key, got)
+		}
+	}
+}

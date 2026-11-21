@@ -47,6 +47,14 @@ func mix(key uint64) uint64 {
 	return key ^ key>>31
 }
 
+func unmix(key uint64) uint64 {
+	// Undo mix in reverse order. The constants are the multiplicative
+	// inverses modulo 2^64.
+	key = (key ^ key>>31 ^ key>>62) * 0x319642b2d24d8ec3
+	key = (key ^ key>>27 ^ key>>54) * 0x96de1b173f119089
+	return key ^ key>>30 ^ key>>60
+}
+
 type event struct {
 	person uint64
 	activity
@@ -78,22 +86,22 @@ type candidateInput struct {
 	start int64
 }
 
-func (in *candidateInput) add(worker int, key uint64, ingest int64, e event) {
+func (in *candidateInput) add(worker int, key uint64, ingest int64, user uint64, e activity) {
 	// The four-digit calendar fits in 39 signed seconds. Biasing the
 	// seconds leaves room for the price and an overflow flag.
 	row := candidate{
 		key:            key,
-		person:         e.person,
+		person:         user,
 		ingestAndPrice: uint64(ingest/1000+ingestBias)<<candidatePriceBits | uint64(e.cents),
 	}
-	if e.person != 0 {
+	if user != 0 {
 		delta := uint64(e.ts) - uint64(in.start)
 		if delta>>candidateTimeBits == 0 && e.category>>16 == 0 {
 			row.timeCategory = uint64(e.category)<<candidateTimeBits | delta
 		} else {
 			row.ingestAndPrice |= candidateWide
 			row.timeCategory = uint64(worker)<<32 | uint64(len(in.wide[worker]))
-			in.wide[worker] = append(in.wide[worker], e.activity)
+			in.wide[worker] = append(in.wide[worker], e)
 		}
 	}
 	in.byKey[worker][key&(bucketCount-1)].add(row)
@@ -142,7 +150,8 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 			return
 		}
 		key := mix(ids.key(f[0]))
-		var e event
+		var user uint64
+		var e activity
 		// Keep invalid candidates in the dedup table. The earliest copy can
 		// suppress a later valid copy, so a zero person marks an invalid winner.
 		if f[1] != "" && f[5] != "" {
@@ -150,22 +159,21 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 			if tsOK && w.start <= ts && ts < w.end && ingest-ts <= dayMillis {
 				switch f[4] {
 				case "view", "cart":
-					e = event{person: ids.key(f[1]), activity: activity{ts: ts}}
+					user = ids.key(f[1])
+					e = activity{ts: ts}
 				case "purchase":
 					if price, priceOK := asciiNumber(f[6], 10_000_000); priceOK && price > 0 {
 						category, found := cat.products[f[5]]
 						if !found {
 							category = cat.unknown
 						}
-						e = event{
-							person:   ids.key(f[1]),
-							activity: activity{ts: ts, cents: uint32(price), category: category},
-						}
+						user = ids.key(f[1])
+						e = activity{ts: ts, cents: uint32(price), category: category}
 					}
 				}
 			}
 		}
-		raw.add(worker, key, ingest, e)
+		raw.add(worker, key, ingest, user, e)
 	}); err != nil {
 		return candidateInput{}, err
 	}
@@ -174,42 +182,84 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 
 func deduplicate(raw candidateInput, workers int, a aliases) []partition[event] {
 	byPerson := make([]partition[event], workers)
+	scratch := make([]dedupScratch, workers)
 	parallel(workers, bucketCount, func(worker, bucket int) {
-		dedup(takeBlocks(raw.byKey, bucket), raw, a, &byPerson[worker])
+		scratch[worker].dedup(takeBlocks(raw.byKey, bucket), raw, a, &byPerson[worker])
 	})
 	return byPerson
 }
 
-func dedup(input blocks[candidate], raw candidateInput, a aliases, output *partition[event]) {
+type dedupScratch struct {
+	counters []uint64
+	slots    []uint64
+}
+
+func clearWords(values []uint64, size int) []uint64 {
+	if cap(values) < size {
+		return make([]uint64, size)
+	}
+	values = values[:size]
+	clear(values)
+	return values
+}
+
+func (s *dedupScratch) dedup(input blocks[candidate], raw candidateInput, a aliases, output *partition[event]) {
 	if input.size == 0 {
 		return
 	}
-	// A slot holds a fingerprint and a row reference. Probe the candidate
-	// block only when the fingerprints agree, then verify the complete ID.
-	capacity := 1 << bits.Len(uint(input.size*3/2))
-	slots := make([]uint64, capacity)
-	for blockNo, block := range input.rows {
-		for i := range block {
-			row := &block[i]
-			ref := uint64(blockNo*blockSize + i + 1)
+	// A two-bit counter records whether each hashed position was seen once
+	// or multiple times. A singleton cannot have an equal candidate.
+	words := 1 << bits.Len(uint((input.size-1)/2))
+	s.counters = clearWords(s.counters, words)
+	mask := uint64(words - 1)
+	suspects := 0
+	for _, block := range input.rows {
+		for _, row := range block {
 			hash := row.key >> bucketBits
-			fingerprint := hash & 0xffffffff00000000
-			slot := int(hash) & (capacity - 1)
+			index := (hash >> 5) & mask
+			seen := uint64(1) << ((hash & 31) << 1)
+			state := s.counters[index]
+			if state&seen == 0 {
+				s.counters[index] = state | seen
+			} else {
+				repeated := seen << 1
+				if state&repeated == 0 {
+					s.counters[index] = state | repeated
+					suspects++
+				}
+				suspects++
+			}
+		}
+	}
+
+	// A collision in the counters goes through exact deduplication. Use
+	// different hash bits for placement so counter collisions spread out.
+	capacity := 1 << bits.Len(uint(suspects*3/2))
+	s.slots = clearWords(s.slots, capacity)
+	for blockNo, block := range input.rows {
+		for i, row := range block {
+			hash := row.key >> bucketBits
+			index := (hash >> 5) & mask
+			repeated := uint64(2) << ((hash & 31) << 1)
+			if s.counters[index]&repeated == 0 {
+				emitWinner(row, raw, a, output)
+				continue
+			}
+			ref := uint64(blockNo*blockSize + i + 1)
+			fingerprint := row.key << 32
+			slot := int(row.key>>32) & (capacity - 1)
 			for {
-				old := slots[slot]
+				old := s.slots[slot]
 				if old == 0 {
-					slots[slot] = fingerprint | ref
+					s.slots[slot] = fingerprint | ref
 					break
 				}
 				if old&0xffffffff00000000 == fingerprint {
 					index := uint32(old) - 1
-					previous := &input.rows[index/blockSize][index%blockSize]
+					previous := input.rows[index/blockSize][index%blockSize]
 					if row.key == previous.key {
 						if row.ingestOrder() < previous.ingestOrder() {
-							slots[slot] = fingerprint | ref
-							previous.person = 0
-						} else {
-							row.person = 0
+							s.slots[slot] = fingerprint | ref
 						}
 						break
 					}
@@ -218,15 +268,18 @@ func dedup(input blocks[candidate], raw candidateInput, a aliases, output *parti
 			}
 		}
 	}
-	// Stream the winners in input order. The hash table is never used to
-	// revisit each unique event through an unrelated memory address.
-	for _, block := range input.rows {
-		for _, row := range block {
-			if row.person != 0 {
-				person, bucket := a.personBucket(row.person)
-				output[bucket].add(event{person, raw.activity(row)})
-			}
+	for _, slot := range s.slots {
+		if slot != 0 {
+			index := uint32(slot) - 1
+			emitWinner(input.rows[index/blockSize][index%blockSize], raw, a, output)
 		}
+	}
+}
+
+func emitWinner(row candidate, raw candidateInput, a aliases, output *partition[event]) {
+	if row.person != 0 {
+		person := a.personHash(row.person)
+		output[person&(bucketCount-1)].add(event{person, raw.activity(row)})
 	}
 }
 
@@ -242,8 +295,8 @@ func readClicks(dir string, workers int, w window, ids *identities, a aliases, c
 		if !ok || ts < w.start-clickLookback || ts >= w.end || campaign == 0 {
 			return
 		}
-		person, bucket := a.personBucket(ids.key(f[1]))
-		result[worker][bucket].add(click{person, touchpoint{ts, ids.key(f[0]), campaign}})
+		person := a.personHash(ids.key(f[1]))
+		result[worker][person&(bucketCount-1)].add(click{person, touchpoint{ts, ids.key(f[0]), campaign}})
 	})
 	return result, err
 }

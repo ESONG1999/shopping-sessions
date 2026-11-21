@@ -101,24 +101,19 @@ type groupNode struct {
 }
 
 type groups struct {
-	index aliases
+	index aliasTable
 	nodes []groupNode
 }
 
 func (g *groups) add(key uint64) uint32 {
 	hash := mix(key)
-	pos := g.index.slot(hash)
+	pos := g.index.slot(hash, 0)
 	if entry := g.index[pos]; entry.hash != 0 {
 		return uint32(entry.person)
 	}
 	if len(g.nodes)*2 == len(g.index) {
-		grown := make(aliases, len(g.index)*2)
-		for _, entry := range g.index {
-			if entry.hash != 0 {
-				grown[grown.slot(entry.hash)] = entry
-			}
-		}
-		g.index, pos = grown, grown.slot(hash)
+		g.index = g.index.grow(0)
+		pos = g.index.slot(hash, 0)
 	}
 	i := uint32(len(g.nodes))
 	g.index[pos] = aliasEntry{hash, uint64(i)}
@@ -155,27 +150,46 @@ type aliasEntry struct {
 	person uint64
 }
 
-type aliases []aliasEntry
+type aliasTable []aliasEntry
 
-func (a aliases) slot(hash uint64) uint64 {
+func (a aliasTable) slot(hash uint64, shift uint) uint64 {
 	mask := uint64(len(a) - 1)
-	i := hash & mask
+	i := (hash >> shift) & mask
 	for a[i].hash != 0 && a[i].hash != hash {
 		i = (i + 1) & mask
 	}
 	return i
 }
 
+func (a aliasTable) grow(shift uint) aliasTable {
+	grown := make(aliasTable, len(a)*2)
+	for _, entry := range a {
+		if entry.hash != 0 {
+			grown[grown.slot(entry.hash, shift)] = entry
+		}
+	}
+	return grown
+}
+
+type aliases struct {
+	entries aliasTable
+	filter  []uint64
+}
+
+func aliasBits(hash uint64) uint64 {
+	return uint64(1)<<((hash>>52)&63) | uint64(1)<<(hash>>58)
+}
+
 func readAliases(dir string, workers int, ids *identities) (aliases, error) {
 	paths, err := csvPaths(dir)
 	if err != nil {
-		return nil, err
+		return aliases{}, err
 	}
 	var bytes int64
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
-			return nil, err
+			return aliases{}, err
 		}
 		bytes += info.Size()
 	}
@@ -183,7 +197,7 @@ func readAliases(dir string, workers int, ids *identities) (aliases, error) {
 	// components only affect allocation, and the table grows if needed.
 	estimate := int(min(max(bytes/16, 32), 1<<22))
 	g := groups{
-		index: make(aliases, 1<<bits.Len(uint(2*estimate-1))),
+		index: make(aliasTable, 1<<bits.Len(uint(2*estimate-1))),
 		nodes: make([]groupNode, 0, estimate),
 	}
 	if err := scanPaths(paths, 1, 2, func(_ int, f []string) {
@@ -191,15 +205,24 @@ func readAliases(dir string, workers int, ids *identities) (aliases, error) {
 			g.join(ids.key(f[0]), ids.key(f[1]), ids)
 		}
 	}); err != nil {
-		return nil, err
+		return aliases{}, err
 	}
 	if len(g.nodes) == 0 {
-		return nil, nil
+		return aliases{}, nil
 	}
 	// Finalize names in place. The graph is immutable during this pass, so
 	// each block can follow parent links without writing shared nodes.
+	words := 1 << max(0, bits.Len(uint(len(g.nodes)-1))-2)
+	filter := make([]uint64, words)
+	localFilters := make([][]uint64, workers)
+	localFilters[0] = filter
 	const block = 16 << 10
-	parallel(workers, (len(g.index)+block-1)/block, func(_, job int) {
+	parallel(workers, (len(g.index)+block-1)/block, func(worker, job int) {
+		local := localFilters[worker]
+		if local == nil {
+			local = make([]uint64, words)
+			localFilters[worker] = local
+		}
 		for i := job * block; i < min((job+1)*block, len(g.index)); i++ {
 			entry := &g.index[i]
 			if entry.hash != 0 {
@@ -207,23 +230,35 @@ func readAliases(dir string, workers int, ids *identities) (aliases, error) {
 				for g.nodes[n].parent != n {
 					n = g.nodes[n].parent
 				}
-				entry.person = g.nodes[n].name
+				entry.person = mix(g.nodes[n].name)
+				// Only aliases with a different canonical ID need a table
+				// probe. Bloom collisions fall through to exact lookup.
+				if entry.hash != entry.person {
+					local[(entry.hash>>bucketBits)&uint64(words-1)] |= aliasBits(entry.hash)
+				}
 			}
 		}
 	})
-	return g.index, nil
-}
-
-func (a aliases) personBucket(key uint64) (uint64, int) {
-	hash := mix(key)
-	if len(a) != 0 {
-		entry := a[a.slot(hash)]
-		if entry.hash != 0 && entry.person != key {
-			key = entry.person
-			hash = mix(key)
+	for _, local := range localFilters[1:] {
+		for i, bits := range local {
+			filter[i] |= bits
 		}
 	}
-	return key, int(hash & (bucketCount - 1))
+	return aliases{entries: g.index, filter: filter}, nil
+}
+
+func (a aliases) personHash(key uint64) uint64 {
+	hash := mix(key)
+	if len(a.filter) != 0 {
+		mask := aliasBits(hash)
+		if a.filter[(hash>>bucketBits)&uint64(len(a.filter)-1)]&mask == mask {
+			entry := a.entries[a.entries.slot(hash, 0)]
+			if entry.hash != 0 {
+				return entry.person
+			}
+		}
+	}
+	return hash
 }
 
 type campaign struct {

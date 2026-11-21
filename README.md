@@ -28,20 +28,20 @@ The official checkers passed all 36 fixtures and matched both Parquet schemas an
 
 ## Local benchmark
 
-Both images ran with eight pinned vCPUs and the same read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The table reports medians from three interleaved trials per image at 20 million events and two per image at 60 million events.
+Both images ran with eight pinned vCPUs and the same read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The 20-million-event result is the median of three interleaved trials per image. The 60-million-event result is from one paired trial with warm inputs and the same output volume.
 
-| Seed | Events | Clicks | Previous wall time (`f81e629`) | Optimized wall time | Optimized peak RSS |
+| Seed | Events | Clicks | Previous wall time (`a91a9fc`) | Optimized wall time | Optimized peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 22 | 20 million | 5 million | 2.32 s | 1.99 s | 2.23 GiB |
-| 42 | 60 million | 15 million | 8.12 s | 7.45 s | 6.80 GiB |
+| 22 | 20 million | 5 million | 2.00 s | 1.87 s | 2.24 GiB |
+| 42 | 60 million | 15 million | 8.51 s | 6.55 s | 6.83 GiB |
 
 Both Parquet tables matched the previous version row for row on each dataset.
 
 ## Pipeline
 
-- Workers scan newline-aligned chunks with an AVX2 delimiter scanner on supported CPUs and a portable word-at-a-time scanner elsewhere. Each worker caches validated calendar prefixes. Union-find builds the identity lookup table while the event scan runs.
-- Workers partition 32-byte event candidates by exact ID. Wide timestamps and large category IDs use a separate payload. Fingerprints filter hash probes before full ID checks, and the winner is the earliest copy even when that copy fails validation. Click scanning overlaps this stage.
-- Counting and prefix sums group surviving rows by person. Workers reuse the person index from the counting pass during scatter. They sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks the crediting click and distinct assisting campaigns.
+- Workers scan newline-aligned chunks with an AVX2 delimiter scanner on supported CPUs and a portable word-at-a-time scanner elsewhere. They validate quote placement once per record and cache validated calendar prefixes. Union-find builds the identity lookup table while the event scan runs. A Bloom filter screens for noncanonical IDs before exact lookup.
+- Workers partition 32-byte event candidates by exact ID. Wide timestamps and large category IDs use a separate payload. Two-bit counters identify hashed positions that need exact deduplication. The earliest copy wins, including when that copy fails validation. Click scanning overlaps this stage.
+- Counting and prefix sums group surviving rows by person. Workers reuse the canonical key for the hash table lookup, then use the same column to store the dense index for scatter. They sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks the crediting click and distinct assisting campaigns.
 - Each worker streams user-day rows into Parquet. Campaign-day totals are merged across the workers.
 
 Production dependencies provide Parquet serialization and read-only memory mapping. [parquet-go](https://github.com/parquet-go/parquet-go) · [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)

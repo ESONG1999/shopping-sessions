@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"math/bits"
 	"slices"
 )
 
@@ -143,7 +144,7 @@ type aggregator struct {
 	revenue     []int64
 	touched     []uint32
 	timeScratch []activity
-	rowGroups   []uint32
+	personIndex aliasTable
 	ads         attribution
 }
 
@@ -158,35 +159,45 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	}
 	// Count both inputs by person. After the prefix sums, the same fields
 	// act as write cursors into compact, contiguous spans.
-	index := make(map[uint64]int, events.size/32)
 	spans := []personSpan{{}}
-	n := events.size + clicks.size
-	if cap(agg.rowGroups) < n {
-		agg.rowGroups = make([]uint32, n)
+	size := 1 << bits.Len(uint(max(31, events.size/16)))
+	if cap(agg.personIndex) < size {
+		agg.personIndex = make(aliasTable, size)
+	} else {
+		agg.personIndex = agg.personIndex[:size]
+		clear(agg.personIndex)
 	}
-	groups := agg.rowGroups[:n]
-	at := 0
+	index := agg.personIndex
 	for _, block := range events.rows {
-		for _, row := range block {
-			i := index[row.person]
+		for j := range block {
+			row := &block[j]
+			hash := row.person
+			slot := index.slot(hash, bucketBits)
+			i := index[slot].person
 			if i == 0 {
-				i = len(spans)
-				index[row.person] = i
-				spans = append(spans, personSpan{id: row.person})
+				if (len(spans)-1)*2 == len(index) {
+					index = index.grow(bucketBits)
+					slot = index.slot(hash, bucketBits)
+				}
+				i = uint64(len(spans))
+				index[slot] = aliasEntry{hash, i}
+				spans = append(spans, personSpan{id: hash})
 			}
 			spans[i].events++
-			groups[at] = uint32(i)
-			at++
+			// The input block is owned by this job. Reuse its key column
+			// for the dense index needed by the scatter pass.
+			row.person = i
 		}
 	}
 	for _, block := range clicks.rows {
-		for _, row := range block {
-			i := index[row.person]
+		for j := range block {
+			row := &block[j]
+			i := index[index.slot(row.person, bucketBits)].person
 			spans[i].clicks++
-			groups[at] = uint32(i)
-			at++
+			row.person = i
 		}
 	}
+	agg.personIndex = index
 	eventCount, clickCount := 0, 0
 	for i := 1; i < len(spans); i++ {
 		span := &spans[i]
@@ -195,23 +206,20 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	}
 	eventRows := make([]activity, eventCount)
 	clickRows := make([]touchpoint, clickCount)
-	at = 0
 	for _, block := range events.rows {
 		for _, row := range block {
-			span := &spans[groups[at]]
+			span := &spans[row.person]
 			eventRows[span.events] = row.activity
 			span.events++
-			at++
 		}
 	}
 	for _, block := range clicks.rows {
 		for _, row := range block {
-			if i := groups[at]; i != 0 {
+			if i := row.person; i != 0 {
 				span := &spans[i]
 				clickRows[span.clicks] = row.touchpoint
 				span.clicks++
 			}
-			at++
 		}
 	}
 
@@ -223,7 +231,7 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 			slices.SortFunc(personClicks, agg.compareClicks)
 			personClicks = slices.CompactFunc(personClicks, func(a, b touchpoint) bool { return a.id == b.id })
 		}
-		if err := agg.person(span.id, personEvents, personClicks); err != nil {
+		if err := agg.person(unmix(span.id), personEvents, personClicks); err != nil {
 			return err
 		}
 		eventAt, clickAt = span.events, span.clicks
