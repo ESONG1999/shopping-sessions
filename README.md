@@ -28,22 +28,20 @@ The official checkers passed all 36 fixtures and matched both Parquet schemas an
 
 ## Local benchmark
 
-Both images ran with eight pinned vCPUs, a 24 GiB container limit, no swap, and read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The warm result is the median of three interleaved runs per image. Cold results are the medians of two paired runs after requesting eviction of the input files from the guest page cache.
+Both images ran with eight pinned vCPUs, a 24 GiB container limit, no swap, and read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The warm result is the median of three interleaved runs per image. For cold runs, the harness requested eviction of the input files from the guest page cache before each run. The 20-million-event cold result is one pair. The 60-million-event result is the median of two pairs with reversed image order.
 
-| Seed | Events | Clicks | Cache | Previous wall time (`b00ed9f`) | Optimized wall time | Optimized cgroup peak |
+| Seed | Events | Clicks | Cache | Previous wall time (`23aa58b`) | Optimized wall time | Optimized cgroup peak |
 | --- | ---: | ---: | --- | ---: | ---: | ---: |
-| 22 | 20 million | 5 million | Warm | 2.16 s | 2.02 s | 1.66 GiB |
-| 22 | 20 million | 5 million | Cold | 3.08 s | 1.97 s | 3.36 GiB |
-| 42 | 60 million | 15 million | Cold | 15.06 s | 9.99 s | 9.86 GiB |
+| 22 | 20 million | 5 million | Warm | 1.99 s | 1.75 s | 1.52 GiB |
+| 22 | 20 million | 5 million | Cold | 2.44 s | 1.97 s | 3.22 GiB |
+| 42 | 60 million | 15 million | Cold | 7.31 s | 6.03 s | 8.82 GiB |
 
-Both Parquet tables matched the previous version row for row on each dataset. On the full cold input the optimized image averaged about seven CPU cores. The cgroup charged about 5.41 GiB of file cache, with no memory-limit events. In a separate cold experiment, retaining a second copy of the CSV in anonymous memory increased peak usage from 11.00 to 15.19 GiB and wall time from 10.98 to 16.04 s.
-
-The full run wrote about 62 MiB of Parquet with zero scratch-file bytes and an observed peak of 11 Linux tasks. The public dev run wrote zero bytes to stdout. The final image was about 10.6 MB, and a local rebuild with the base image and dependencies cached took about 8.5 s.
+Both Parquet tables matched the previous version row for row on each dataset. On the 60-million-event cold runs, the cgroup peak fell from 9.86 GiB to at most 8.82 GiB, including about 5.41 GiB of file cache. The optimized image averaged about seven CPU cores, peaked at 11 Linux tasks, and recorded zero memory-limit events.
 
 ## Pipeline
 
 - Workers align input chunks to newline boundaries in parallel and scan delimiters with AVX2 where supported. Union-find builds the identity lookup table while the event scan runs. Click parsing starts as soon as that table is ready.
-- Workers store 32-byte event candidates in per-worker slabs and partition by exact ID. A sparse exact hash table trades extra index space for shorter probes. The earliest copy wins, including when that copy fails validation.
+- Workers store event payloads by person and partition 16-byte references by event ID. A sparse exact hash table marks duplicate payloads in place. The earliest copy wins, including when that copy fails validation. For rows parsed before identity links are ready, only surviving payloads whose canonical person falls in a different bucket need to move.
 - Counting and prefix sums group surviving rows by person. Workers reuse scatter buffers and schedule larger buckets first. They sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks the crediting click and distinct assisting campaigns.
 - Each worker streams user-day rows into Parquet. Campaign-day totals are merged across the workers.
 

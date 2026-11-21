@@ -248,7 +248,10 @@ func readAliases(dir string, workers int, ids *identities) (aliases, error) {
 }
 
 func (a aliases) personHash(key uint64) uint64 {
-	hash := mix(key)
+	return a.canonicalHash(mix(key))
+}
+
+func (a aliases) canonicalHash(hash uint64) uint64 {
 	if len(a.filter) != 0 {
 		mask := aliasBits(hash)
 		if a.filter[(hash>>bucketBits)&uint64(len(a.filter)-1)]&mask == mask {

@@ -9,6 +9,7 @@ const (
 	bucketCount = 1 << bucketBits
 	blockSize   = 2048
 	slabBlocks  = 32
+	slabRows    = slabBlocks * blockSize
 )
 
 // Fixed-size blocks let workers partition rows without slice growth copying
@@ -27,15 +28,20 @@ func (p *partition[T]) add(bucket uint64, row T) {
 	b := &p.buckets[bucket]
 	i := len(b.rows) - 1
 	if i < 0 || len(b.rows[i]) == blockSize {
-		if len(p.spare) == 0 {
-			p.spare = make([]T, slabBlocks*blockSize)
-		}
-		b.rows = append(b.rows, p.spare[:0:blockSize])
-		p.spare = p.spare[blockSize:]
+		b.rows = append(b.rows, p.takeBlock())
 		i++
 	}
 	b.rows[i] = append(b.rows[i], row)
 	b.size++
+}
+
+func (p *partition[T]) takeBlock() []T {
+	if len(p.spare) == 0 {
+		p.spare = make([]T, slabRows)
+	}
+	block := p.spare[:0:blockSize]
+	p.spare = p.spare[blockSize:]
+	return block
 }
 
 func takeBlocks[T any](workers []partition[T], bucket int) blocks[T] {
@@ -75,60 +81,104 @@ type activity struct {
 	category uint32
 }
 
-type candidate struct {
-	key            uint64
-	person         uint64
-	timeCategory   uint64
-	ingestAndPrice uint64
+// Each entry carries a full event ID and a reference into its worker's
+// person-partitioned payload slabs. Reference zero represents an invalid row.
+type eventKey struct {
+	key     uint64
+	timeRef uint64
 }
 
 const (
-	candidatePriceBits = 24
-	candidateTimeBits  = 48
-	candidateWide      = uint64(1) << 63
-	ingestBias         = int64(1) << 38
+	wideIngest = uint32(1) << 31
+	rawUserRef = uint32(1) << 31
+	ingestBias = int64(1) << 30
 )
 
-type candidateInput struct {
-	byKey []partition[candidate]
-	wide  [][]activity
-	start int64
+type eventStore struct {
+	partition[event]
+	slabs [][]event
+	next  [bucketCount]uint32
 }
 
-func (in *candidateInput) add(worker int, key uint64, ingest int64, user uint64, e activity) {
-	// The four-digit calendar fits in 39 signed seconds. Biasing the
-	// seconds leaves room for the price and an overflow flag.
-	row := candidate{
-		key:            key,
-		person:         user,
-		ingestAndPrice: uint64(ingest/1000+ingestBias)<<candidatePriceBits | uint64(e.cents),
+func (s *eventStore) append(person uint64, a activity) uint32 {
+	bucket := person & (bucketCount - 1)
+	b := &s.buckets[bucket]
+	i := len(b.rows) - 1
+	if i < 0 || len(b.rows[i]) == blockSize {
+		if len(s.spare) == 0 {
+			s.spare = make([]event, slabRows)
+			s.slabs = append(s.slabs, s.spare)
+		}
+		s.next[bucket] = uint32(len(s.slabs)*slabRows - len(s.spare) + 1)
+		b.rows = append(b.rows, s.takeBlock())
+		i++
 	}
-	if user != 0 {
-		delta := uint64(e.ts) - uint64(in.start)
-		if delta>>candidateTimeBits == 0 && e.category>>16 == 0 {
-			row.timeCategory = uint64(e.category)<<candidateTimeBits | delta
+	ref := s.next[bucket]
+	s.next[bucket]++
+	b.rows[i] = append(b.rows[i], event{person, a})
+	b.size++
+	return ref
+}
+
+func (s *eventStore) discard(ref uint32) {
+	if ref != 0 {
+		ref--
+		s.slabs[ref/slabRows][ref%slabRows].person = 0
+	}
+}
+
+type inputEvent struct {
+	key, user uint64
+	ingest    int64
+	activity
+}
+
+type eventLane struct {
+	keys     partition[eventKey]
+	events   eventStore
+	rawUsers eventStore
+	farTimes []int64
+	aliases  *aliases
+}
+
+type eventInput struct {
+	lanes []eventLane
+	base  int64
+}
+
+func (lane *eventLane) add(row inputEvent, base int64) {
+	var ref uint32
+	if row.user != 0 {
+		hash := mix(row.user)
+		if lane.aliases == nil {
+			ref = rawUserRef | lane.rawUsers.append(hash, row.activity)
 		} else {
-			row.ingestAndPrice |= candidateWide
-			row.timeCategory = uint64(worker)<<32 | uint64(len(in.wide[worker]))
-			in.wide[worker] = append(in.wide[worker], e)
+			ref = lane.events.append(lane.aliases.canonicalHash(hash), row.activity)
 		}
 	}
-	in.byKey[worker].add(key&(bucketCount-1), row)
+	ingest := row.ingest / 1000
+	delta := uint64(ingest - base)
+	code := uint32(delta)
+	if delta >= uint64(wideIngest) {
+		code = wideIngest | uint32(len(lane.farTimes))
+		lane.farTimes = append(lane.farTimes, ingest)
+	}
+	lane.keys.add(row.key&(bucketCount-1), eventKey{row.key, uint64(code)<<32 | uint64(ref)})
 }
 
-func (row candidate) ingestOrder() uint64 {
-	return (row.ingestAndPrice &^ candidateWide) >> candidatePriceBits
+func (lane *eventLane) discard(ref uint32) {
+	if ref&rawUserRef != 0 {
+		lane.rawUsers.discard(ref &^ rawUserRef)
+	} else {
+		lane.events.discard(ref)
+	}
 }
 
-func (in candidateInput) activity(row candidate) activity {
-	if row.ingestAndPrice&candidateWide != 0 {
-		return in.wide[row.timeCategory>>32][uint32(row.timeCategory)]
+func (lane *eventLane) ingestTime(code uint32, base int64) int64 {
+	if code&wideIngest != 0 {
+		return lane.farTimes[code&^wideIngest]
 	}
-	return activity{
-		ts:       in.start + int64(row.timeCategory&((1<<candidateTimeBits)-1)),
-		cents:    uint32(row.ingestAndPrice & ((1 << candidatePriceBits) - 1)),
-		category: uint32(row.timeCategory >> candidateTimeBits),
-	}
+	return base + int64(code)
 }
 
 type click struct {
@@ -142,65 +192,107 @@ type touchpoint struct {
 	campaign uint32
 }
 
-func readEventCandidates(dir string, workers int, w window, ids *identities, cat catalog) (candidateInput, error) {
-	raw := candidateInput{
-		byKey: make([]partition[candidate], workers),
-		wide:  make([][]activity, workers),
-		start: w.start,
+func readEventCandidates(dir string, workers int, w window, ids *identities, cat catalog, a *aliases, ready <-chan struct{}) (eventInput, error) {
+	paths, err := csvPaths(dir)
+	if err != nil {
+		return eventInput{}, err
 	}
+	raw := eventInput{lanes: make([]eventLane, workers), base: w.start/1000 - ingestBias}
 	decoders := make([]timestampDecoder, workers)
-	if err := scanParts(dir, workers, 7, func(worker int, f []string) {
-		if f[0] == "" {
-			return
+	if err := scanChunks(paths, workers, func(worker int, text string) {
+		lane := &raw.lanes[worker]
+		if lane.aliases == nil {
+			select {
+			case <-ready:
+				lane.aliases = a
+			default:
+			}
 		}
 		decoder := &decoders[worker]
-		ingest, ok := decoder.calendar(f[3])
-		if !ok {
-			return
-		}
-		key := mix(ids.key(f[0]))
-		var user uint64
-		var e activity
-		// Keep invalid candidates in the dedup table. The earliest copy can
-		// suppress a later valid copy, so a zero person marks an invalid winner.
-		if f[1] != "" && f[5] != "" {
-			ts, tsOK := decoder.timestamp(f[2])
-			if tsOK && w.start <= ts && ts < w.end && ingest-ts <= dayMillis {
-				switch f[4] {
-				case "view", "cart":
-					user = ids.key(f[1])
-					e = activity{ts: ts}
-				case "purchase":
-					if price, priceOK := asciiNumber(f[6], 10_000_000); priceOK && price > 0 {
-						category, found := cat.products[f[5]]
-						if !found {
-							category = cat.unknown
+		scanCSV(text, 7, func(f []string) {
+			if f[0] == "" {
+				return
+			}
+			ingest, ok := decoder.calendar(f[3])
+			if !ok {
+				return
+			}
+			row := inputEvent{key: mix(ids.key(f[0])), ingest: ingest}
+			// A validly structured row with invalid activity still takes
+			// part in deduplication, with no payload reference.
+			if f[1] != "" && f[5] != "" {
+				ts, tsOK := decoder.timestamp(f[2])
+				if tsOK && w.start <= ts && ts < w.end && ingest-ts <= dayMillis {
+					switch f[4] {
+					case "view", "cart":
+						row.user = ids.key(f[1])
+						row.ts = ts
+					case "purchase":
+						if price, priceOK := asciiNumber(f[6], 10_000_000); priceOK && price > 0 {
+							category, found := cat.products[f[5]]
+							if !found {
+								category = cat.unknown
+							}
+							row.user = ids.key(f[1])
+							row.activity = activity{ts: ts, cents: uint32(price), category: category}
 						}
-						user = ids.key(f[1])
-						e = activity{ts: ts, cents: uint32(price), category: category}
 					}
 				}
 			}
-		}
-		raw.add(worker, key, ingest, user, e)
+			lane.add(row, raw.base)
+		})
 	}); err != nil {
-		return candidateInput{}, err
+		return eventInput{}, err
 	}
 	return raw, nil
 }
 
-func deduplicate(raw candidateInput, workers int, a aliases) []partition[event] {
-	byPerson := make([]partition[event], workers)
+func deduplicate(raw *eventInput, workers int, a aliases) []partition[event] {
 	scratch := make([]dedupScratch, workers)
 	parallel(workers, bucketCount, func(worker, bucket int) {
-		scratch[worker].dedup(takeBlocks(raw.byKey, bucket), raw, a, &byPerson[worker])
+		scratch[worker].dedup(raw, bucket)
 	})
-	return byPerson
+	out := make([]partition[event], len(raw.lanes))
+	parallel(workers, len(out), func(_, i int) {
+		lane := &raw.lanes[i]
+		// Events parsed before the alias table was ready are already
+		// bucketed by original user. Only a bucket change needs a copy.
+		for bucket, b := range lane.rawUsers.buckets {
+			for _, block := range b.rows {
+				for j := range block {
+					row := &block[j]
+					if row.person == 0 {
+						continue
+					}
+					person := a.canonicalHash(row.person)
+					if person&(bucketCount-1) == uint64(bucket) {
+						row.person = person
+					} else {
+						lane.events.append(person, row.activity)
+						row.person = 0
+					}
+				}
+			}
+		}
+		for bucket, b := range lane.rawUsers.buckets {
+			dst := &lane.events.buckets[bucket]
+			dst.rows = append(dst.rows, b.rows...)
+			dst.size += b.size
+		}
+		out[i] = lane.events.partition
+	})
+	return out
+}
+
+type eventKeyBlock struct {
+	rows []eventKey
+	lane *eventLane
 }
 
 type dedupScratch struct {
-	refs  []uint32
-	slots []uint64
+	blocks []eventKeyBlock
+	refs   []uint32
+	slots  []uint64
 }
 
 func clearWords(values []uint64, size int) []uint64 {
@@ -212,22 +304,30 @@ func clearWords(values []uint64, size int) []uint64 {
 	return values
 }
 
-func (s *dedupScratch) dedup(input blocks[candidate], raw candidateInput, a aliases, output *partition[event]) {
-	if input.size == 0 {
+func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
+	s.blocks = s.blocks[:0]
+	size := 0
+	for i := range raw.lanes {
+		lane := &raw.lanes[i]
+		b := &lane.keys.buckets[bucket]
+		for _, rows := range b.rows {
+			s.blocks = append(s.blocks, eventKeyBlock{rows, lane})
+		}
+		size += b.size
+		*b = blocks[eventKey]{}
+	}
+	if size == 0 {
 		return
 	}
-	// Keep load below 25% to avoid long probes. The row reference is in
-	// a separate array, so unrelated keys only touch the key table.
-	capacity := 1 << bits.Len(uint(4*input.size-1))
+	capacity := 1 << bits.Len(uint(4*size-1))
 	s.slots = clearWords(s.slots, capacity)
 	if cap(s.refs) < capacity {
 		s.refs = make([]uint32, capacity)
 	}
 	refs := s.refs[:capacity]
 	mask := capacity - 1
-	for blockNo, block := range input.rows {
-		for i := range block {
-			row := &block[i]
+	for blockNo, block := range s.blocks {
+		for i, row := range block.rows {
 			ref := uint32(blockNo*blockSize + i)
 			slot := int(row.key>>bucketBits) & mask
 			for {
@@ -239,12 +339,19 @@ func (s *dedupScratch) dedup(input blocks[candidate], raw candidateInput, a alia
 				}
 				if previous == row.key {
 					old := refs[slot]
-					earlier := &input.rows[old/blockSize][old%blockSize]
-					if row.ingestOrder() < earlier.ingestOrder() {
+					oldBlock := s.blocks[old/blockSize]
+					earlier := oldBlock.rows[old%blockSize]
+					t, last := uint32(row.timeRef>>32), uint32(earlier.timeRef>>32)
+					replace := t < last
+					if (t|last)&wideIngest != 0 {
+						replace = block.lane.ingestTime(t, raw.base) <
+							oldBlock.lane.ingestTime(last, raw.base)
+					}
+					if replace {
 						refs[slot] = ref
-						earlier.person = 0
+						oldBlock.lane.discard(uint32(earlier.timeRef))
 					} else {
-						row.person = 0
+						block.lane.discard(uint32(row.timeRef))
 					}
 					break
 				}
@@ -252,18 +359,7 @@ func (s *dedupScratch) dedup(input blocks[candidate], raw candidateInput, a alia
 			}
 		}
 	}
-	for _, block := range input.rows {
-		for _, row := range block {
-			emitWinner(row, raw, a, output)
-		}
-	}
-}
-
-func emitWinner(row candidate, raw candidateInput, a aliases, output *partition[event]) {
-	if row.person != 0 {
-		person := a.personHash(row.person)
-		output.add(person&(bucketCount-1), event{person, raw.activity(row)})
-	}
+	clear(s.blocks)
 }
 
 func readClicks(dir string, workers int, w window, ids *identities, a aliases, cat catalog) ([]partition[click], error) {

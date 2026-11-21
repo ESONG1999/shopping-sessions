@@ -124,6 +124,12 @@ func scanParts(dir string, workers, width int, visit func(int, []string)) error 
 }
 
 func scanPaths(paths []string, workers, width int, visit func(int, []string)) error {
+	return scanChunks(paths, workers, func(worker int, text string) {
+		scanCSV(text, width, func(record []string) { visit(worker, record) })
+	})
+}
+
+func scanChunks(paths []string, workers int, visit func(int, string)) error {
 	var mappings [][]byte
 	defer func() {
 		for _, data := range mappings {
@@ -146,9 +152,7 @@ func scanPaths(paths []string, workers, width int, visit func(int, []string)) er
 		}
 	}
 	parallel(workers, len(jobs), func(worker, job int) {
-		scanCSV(jobs[job].records(), width, func(record []string) {
-			visit(worker, record)
-		})
+		visit(worker, jobs[job].records())
 	})
 	return nil
 }

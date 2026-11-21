@@ -175,6 +175,9 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 		for j := range block {
 			row := &block[j]
 			hash := row.person
+			if hash == 0 {
+				continue
+			}
 			slot := index.slot(hash, bucketBits)
 			i := index[slot].person
 			if i == 0 {
@@ -219,6 +222,9 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	clickRows := agg.clickRows[:clickCount]
 	for _, block := range events.rows {
 		for _, row := range block {
+			if row.person == 0 {
+				continue
+			}
 			span := &spans[row.person]
 			eventRows[span.events] = row.activity
 			span.events++
