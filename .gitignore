@@ -1,0 +1,11 @@
+/.build/
+/.venv/
+/data/
+/dev/
+/dev-answer/
+/fixtures/
+/out/
+/output/
+/scratch/
+/starter-duckdb/
+/*.zip
