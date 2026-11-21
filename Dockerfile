@@ -6,12 +6,12 @@ WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN go mod download
-COPY *.go ./
+COPY *.go *.s ./
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /shopping-sessions .
 
 FROM scratch
 COPY --from=build /shopping-sessions /shopping-sessions
 USER 1000:1000
-ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch NCPU=8 MEM_GB=24
+ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch NCPU=8 MEM_GB=24 GOGC=200
 ENTRYPOINT ["/shopping-sessions"]

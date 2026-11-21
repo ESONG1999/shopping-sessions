@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,12 +18,28 @@ const (
 // Short ASCII IDs are encoded losslessly and retain their bytewise sort order.
 // All other IDs are interned by exact string equality.
 type identities struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	extended map[string]uint64
 	names    []string
 }
 
 func (ids *identities) key(s string) uint64 {
+	if len(s) == 8 || len(s) == 9 {
+		const ones, high = 0x0101010101010101, 0x8080808080808080
+		word := binary.BigEndian.Uint64([]byte(s))
+		if (word|((word-ones)&^word))&high == 0 {
+			// Remove the unused high bit from each of eight ASCII bytes.
+			pairs := (word&0x7f007f007f007f00)>>1 | word&0x007f007f007f007f
+			halves := (pairs&0x3fff00003fff0000)>>2 | pairs&0x00003fff00003fff
+			key := ((halves&0x0fffffff00000000)>>4 | halves&0x000000000fffffff) << 7
+			if len(s) == 8 {
+				return key
+			}
+			if last := s[8]; last > 0 && last < 128 {
+				return key | uint64(last)
+			}
+		}
+	}
 	if len(s) <= packedBytes {
 		var key uint64
 		for i := 0; i < len(s); i++ {
@@ -55,7 +72,10 @@ func (ids *identities) intern(s string) uint64 {
 
 func (ids *identities) name(key uint64) string {
 	if key&externalID != 0 {
-		return ids.names[key&^externalID]
+		ids.mu.RLock()
+		name := ids.names[key&^externalID]
+		ids.mu.RUnlock()
+		return name
 	}
 	var buf [packedBytes]byte
 	n := 0
@@ -122,9 +142,8 @@ type aliases map[uint64]uint64
 
 func readAliases(dir string, ids *identities) (aliases, error) {
 	g := groups{index: make(map[uint64]uint32)}
-	if err := scanParts(dir, 1, func(_ int, line string) {
-		var f [2]string
-		if fields(line, f[:]) && f[0] != "" && f[1] != "" {
+	if err := scanParts(dir, 1, 2, func(_ int, f []string) {
+		if f[0] != "" && f[1] != "" {
 			g.join(ids.key(f[0]), ids.key(f[1]), ids)
 		}
 	}); err != nil {

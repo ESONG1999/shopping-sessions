@@ -9,10 +9,12 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	parquet "github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress/snappy"
+	"golang.org/x/sys/unix"
 )
 
 const rowGroupSize = 64 << 10
@@ -97,7 +99,7 @@ func prepareTable(dir string) error {
 	return nil
 }
 
-func writeTables(out string, workers int, events []partition[event], clicks []partition[click], ids *identities, c catalog) error {
+func writeTables(out string, workers int, events []partition[event], clicks []partition[click], ids *identities, c catalog, w window) error {
 	userDir, campaignDir := filepath.Join(out, "user_daily"), filepath.Join(out, "campaign_daily")
 	if err := prepareTable(userDir); err != nil {
 		return err
@@ -106,6 +108,12 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 		return err
 	}
 
+	firstDay := floorDiv(w.start, dayMillis)
+	lastDay := floorDiv(w.end-1, dayMillis)
+	days := lastDay - firstDay + 1
+	campaignCount := len(c.campaigns)
+	useDense := days <= 65_536/int64(campaignCount) &&
+		firstDay == int64(int32(firstDay)) && lastDay == int64(int32(lastDay))
 	states := make([]aggregator, workers)
 	for i := range states {
 		writer, err := openTable[userDaily](userDir, i)
@@ -119,9 +127,15 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 			names:    c.categories,
 			revenue:  make([]int64, len(c.categories)),
 			ads: attribution{
-				sums:   make(map[campaignDay]campaignTotals),
-				states: make([]activeCampaign, len(c.campaigns)),
+				states:   make([]activeCampaign, campaignCount),
+				firstDay: int32(firstDay),
 			},
+		}
+		// Keep the hot campaign/day cells contiguous for small windows.
+		if useDense {
+			states[i].ads.dense = make([]campaignTotals, int(days)*campaignCount)
+		} else {
+			states[i].ads.sums = make(map[campaignDay]campaignTotals)
 		}
 	}
 	failures := make([]error, workers)
@@ -129,8 +143,8 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 		if failures[worker] != nil {
 			return
 		}
-		ev := takeBlocks(events, bucket).flatten()
-		cl := takeBlocks(clicks, bucket).flatten()
+		ev := takeBlocks(events, bucket)
+		cl := takeBlocks(clicks, bucket)
 		failures[worker] = states[worker].process(ev, cl)
 	})
 	if err := errors.Join(failures...); err != nil {
@@ -147,14 +161,20 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 
 func writeCampaigns(dir string, campaigns []campaign, states []aggregator) error {
 	totals := make(map[campaignDay]campaignTotals)
+	merge := func(k campaignDay, v campaignTotals) {
+		total := totals[k]
+		total.add(v)
+		totals[k] = total
+	}
 	for _, state := range states {
+		for i, v := range state.ads.dense {
+			if v.credited != 0 || v.assisted != 0 {
+				k := campaignDay{uint32(i % len(campaigns)), state.ads.firstDay + int32(i/len(campaigns))}
+				merge(k, v)
+			}
+		}
 		for k, v := range state.ads.sums {
-			t := totals[k]
-			t.credited += v.credited
-			t.purchasing += v.purchasing
-			t.revenue += v.revenue
-			t.assisted += v.assisted
-			totals[k] = t
+			merge(k, v)
 		}
 	}
 	writer, err := openTable[campaignDaily](dir, 0)
@@ -186,25 +206,36 @@ func run(data, out string, workers int) error {
 		return err
 	}
 	ids := &identities{}
-	a, err := readAliases(filepath.Join(data, "links"), ids)
-	if err != nil {
+	var a aliases
+	var aliasErr error
+	var pending sync.WaitGroup
+	pending.Add(1)
+	go func() {
+		defer pending.Done()
+		a, aliasErr = readAliases(filepath.Join(data, "links"), ids)
+	}()
+	raw, err := readEventCandidates(filepath.Join(data, "events"), workers, w, ids, c)
+	pending.Wait()
+	if err := errors.Join(err, aliasErr); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "catalogs and links: %v\n", time.Since(started).Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "catalogs, links and event scan: %v\n", time.Since(started).Round(time.Millisecond))
 	stage := time.Now()
-	ev, err := readEvents(filepath.Join(data, "events"), workers, w, ids, a, c)
-	if err != nil {
-		return err
+	var cl []partition[click]
+	var clickErr error
+	pending.Add(1)
+	go func() {
+		defer pending.Done()
+		cl, clickErr = readClicks(filepath.Join(data, "clicks"), workers, w, ids, a, c)
+	}()
+	ev := deduplicate(raw, workers, a)
+	pending.Wait()
+	if clickErr != nil {
+		return clickErr
 	}
-	fmt.Fprintf(os.Stderr, "events and deduplication: %v\n", time.Since(stage).Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "event deduplication and click scan: %v\n", time.Since(stage).Round(time.Millisecond))
 	stage = time.Now()
-	cl, err := readClicks(filepath.Join(data, "clicks"), workers, w, ids, a, c)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "clicks: %v\n", time.Since(stage).Round(time.Millisecond))
-	stage = time.Now()
-	if err := writeTables(out, workers, ev, cl, ids, c); err != nil {
+	if err := writeTables(out, workers, ev, cl, ids, c, w); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "sessions, attribution and Parquet: %v (total: %v)\n",
@@ -227,6 +258,7 @@ func positiveInt(name string, fallback int) int {
 }
 
 func main() {
+	started := time.Now()
 	data, out := getenv("DATA_DIR", "/data"), getenv("OUTPUT_DIR", "/output")
 	switch len(os.Args) {
 	case 1:
@@ -242,5 +274,15 @@ func main() {
 	if err := run(data, out, workers); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	var usage unix.Rusage
+	if unix.Getrusage(unix.RUSAGE_SELF, &usage) == nil {
+		cpu := time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
+		rss := float64(usage.Maxrss)
+		if runtime.GOOS == "linux" {
+			rss *= 1024
+		}
+		fmt.Fprintf(os.Stderr, "resources: %d workers, %.2f CPUs on average, %.2f GiB peak RSS\n",
+			workers, float64(cpu)/float64(time.Since(started)), rss/(1<<30))
 	}
 }

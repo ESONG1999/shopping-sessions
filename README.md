@@ -21,24 +21,29 @@ make check-fixtures STARTER=/path/to/starter-duckdb
 make dev
 make run-dev
 make check-dev STARTER=/path/to/starter-duckdb ANSWER=/path/to/dev-answer
+go test ./...
 ```
 
 The official checkers passed all 36 fixtures and matched both Parquet schemas and all rows on the one-million-event dev set. The dev set also matched when the `linux/amd64` image ran offline with a read-only root filesystem and UID 1000.
 
 ## Local benchmark
 
-Measured on an Apple M1 Max with eight workers using data from the official generator. Native wall time covers binary launch through Parquet output. Container wall time includes startup in a local Linux VM running the amd64 image through Rosetta.
+Both images ran with eight pinned vCPUs and the same read-only inputs from the official generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The 20-million-event result is the median of three interleaved trials per image. The 60-million-event result is from one trial per image.
 
-| Seed | Events | Clicks | Native wall time | Native peak RSS | Container wall time |
+| Seed | Events | Clicks | Previous wall time | Optimized wall time | Optimized peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 22 | 20 million | 5 million | 2.85 s | 2.33 GiB | 5.44 s |
-| 42 | 60 million | 15 million | 10.48 s | 7.19 GiB | 21.08 s |
+| 22 | 20 million | 5 million | 3.82 s | 2.11 s | 2.40 GiB |
+| 42 | 60 million | 15 million | 16.60 s | 8.91 s | 7.38 GiB |
+
+The optimized image averaged 6.65 CPU cores on the 20-million-event trials and 6.74 on the 60-million-event trial. Both Parquet tables matched the previous version row for row on each dataset.
+
+A separate 20-million-event run measured about 6.04 active cores for the previous image and 6.53 for the optimized image using Linux cgroup CPU counters. The optimized binary took 3.09 s with four workers and 1.89 s with eight workers, excluding container startup.
 
 ## Pipeline
 
-- Union-find resolves transitive links and retains the bytewise smallest identifier for each person.
-- Workers scan newline-aligned chunks and partition event candidates by exact ID. The deduplication table retains the earliest copy even when that copy fails validation.
-- Workers sort surviving events and clicks within person partitions. They walk session starts and maintain the last eligible click plus each campaign's active span, so repeated clicks contribute one assist per campaign per session.
+- Workers scan newline-aligned chunks with an AVX2 delimiter scanner on supported CPUs and a portable word-at-a-time scanner elsewhere. Union-find resolves transitive links while the event scan runs.
+- Workers partition event candidates by exact ID. Fingerprints filter hash probes before full ID checks, and the winner is the earliest copy even when that copy fails validation. Click scanning overlaps this stage.
+- Counting and prefix sums group surviving rows by person. Workers sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks both the crediting click and distinct assisting campaigns.
 - Each worker streams user-day rows into Parquet. Campaign-day totals are merged across the workers.
 
 Production dependencies provide Parquet serialization and read-only memory mapping. [parquet-go](https://github.com/parquet-go/parquet-go) · [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)

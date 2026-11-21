@@ -115,7 +115,7 @@ func mapFile(path string) ([]byte, error) {
 
 // Divide large files at newline boundaries so a single large part can use all workers.
 // The visitor must copy any strings it keeps after the job finishes.
-func scanParts(dir string, workers int, visit func(int, string)) error {
+func scanParts(dir string, workers, width int, visit func(int, []string)) error {
 	paths, err := csvPaths(dir)
 	if err != nil {
 		return err
@@ -152,8 +152,8 @@ func scanParts(dir string, workers int, visit func(int, string)) error {
 		}
 	}
 	parallel(workers, len(jobs), func(worker, job int) {
-		lines(jobs[job], func(line string) {
-			visit(worker, line)
+		scanCSV(jobs[job], width, func(record []string) {
+			visit(worker, record)
 		})
 	})
 	return nil

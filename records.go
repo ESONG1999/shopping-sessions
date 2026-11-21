@@ -40,17 +40,6 @@ func takeBlocks[T any](workers []partition[T], bucket int) blocks[T] {
 	return result
 }
 
-func (b blocks[T]) flatten() []T {
-	if len(b.rows) == 1 {
-		return b.rows[0]
-	}
-	result := make([]T, 0, b.size)
-	for _, block := range b.rows {
-		result = append(result, block...)
-	}
-	return result
-}
-
 func mix(key uint64) uint64 {
 	key = (key ^ key>>30) * 0xbf58476d1ce4e5b9
 	key = (key ^ key>>27) * 0x94d049bb133111eb
@@ -62,7 +51,11 @@ func bucketFor(key uint64) int {
 }
 
 type event struct {
-	person   uint64
+	person uint64
+	activity
+}
+
+type activity struct {
 	ts       int64
 	cents    uint32
 	category uint32
@@ -75,17 +68,20 @@ type candidate struct {
 }
 
 type click struct {
-	person   uint64
+	person uint64
+	touchpoint
+}
+
+type touchpoint struct {
 	ts       int64
 	id       uint64
 	campaign uint32
 }
 
-func readEvents(dir string, workers int, w window, ids *identities, a aliases, cat catalog) ([]partition[event], error) {
+func readEventCandidates(dir string, workers int, w window, ids *identities, cat catalog) ([]partition[candidate], error) {
 	raw := make([]partition[candidate], workers)
-	if err := scanParts(dir, workers, func(worker int, line string) {
-		var f [7]string
-		if !fields(line, f[:]) || f[0] == "" {
+	if err := scanParts(dir, workers, 7, func(worker int, f []string) {
+		if f[0] == "" {
 			return
 		}
 		ingest, ok := calendarTimestamp(f[3])
@@ -93,7 +89,7 @@ func readEvents(dir string, workers int, w window, ids *identities, a aliases, c
 			return
 		}
 		id := ids.key(f[0])
-		e := event{ts: 0}
+		var e event
 		// Keep invalid candidates in the dedup table. The earliest copy can
 		// suppress a later valid copy, so a zero person marks an invalid winner.
 		if f[1] != "" && f[5] != "" {
@@ -101,14 +97,17 @@ func readEvents(dir string, workers int, w window, ids *identities, a aliases, c
 			if tsOK && w.start <= ts && ts < w.end && ingest-ts <= dayMillis {
 				switch f[4] {
 				case "view", "cart":
-					e = event{person: a.person(ids.key(f[1])), ts: ts}
+					e = event{person: ids.key(f[1]), activity: activity{ts: ts}}
 				case "purchase":
 					if price, priceOK := asciiNumber(f[6], 10_000_000); priceOK && price > 0 {
 						category, found := cat.products[f[5]]
 						if !found {
 							category = cat.unknown
 						}
-						e = event{person: a.person(ids.key(f[1])), ts: ts, cents: uint32(price), category: category}
+						e = event{
+							person:   ids.key(f[1]),
+							activity: activity{ts: ts, cents: uint32(price), category: category},
+						}
 					}
 				}
 			}
@@ -117,46 +116,62 @@ func readEvents(dir string, workers int, w window, ids *identities, a aliases, c
 	}); err != nil {
 		return nil, err
 	}
-	byPerson := make([]partition[event], workers)
-	parallel(workers, bucketCount, func(worker, bucket int) {
-		dedup(takeBlocks(raw, bucket), &byPerson[worker])
-	})
-	return byPerson, nil
+	return raw, nil
 }
 
-func dedup(input blocks[candidate], output *partition[event]) {
+func deduplicate(raw []partition[candidate], workers int, a aliases) []partition[event] {
+	byPerson := make([]partition[event], workers)
+	parallel(workers, bucketCount, func(worker, bucket int) {
+		dedup(takeBlocks(raw, bucket), a, &byPerson[worker])
+	})
+	return byPerson
+}
+
+func dedup(input blocks[candidate], a aliases, output *partition[event]) {
 	if input.size == 0 {
 		return
 	}
-	// The open-addressing table holds row references. Event keys are exact,
-	// so hash collisions affect placement only.
+	// A slot holds a fingerprint and a row reference. Probe the candidate
+	// block only when the fingerprints agree, then verify the complete ID.
 	capacity := 1 << bits.Len(uint(input.size*3/2))
-	slots := make([]uint32, capacity)
+	slots := make([]uint64, capacity)
 	for blockNo, block := range input.rows {
-		for i, row := range block {
-			ref := uint32(blockNo*blockSize + i + 1)
-			slot := int(mix(row.id)>>bucketBits) & (capacity - 1)
+		for i := range block {
+			row := &block[i]
+			ref := uint64(blockNo*blockSize + i + 1)
+			hash := mix(row.id) >> bucketBits
+			fingerprint := hash & 0xffffffff00000000
+			slot := int(hash) & (capacity - 1)
 			for {
 				old := slots[slot]
 				if old == 0 {
-					slots[slot] = ref
+					slots[slot] = fingerprint | ref
 					break
 				}
-				previous := input.rows[(old-1)/blockSize][(old-1)%blockSize]
-				if row.id == previous.id {
-					if row.ingest < previous.ingest {
-						slots[slot] = ref
+				if old&0xffffffff00000000 == fingerprint {
+					index := uint32(old) - 1
+					previous := &input.rows[index/blockSize][index%blockSize]
+					if row.id == previous.id {
+						if row.ingest < previous.ingest {
+							slots[slot] = fingerprint | ref
+							previous.person = 0
+						} else {
+							row.person = 0
+						}
+						break
 					}
-					break
 				}
 				slot = (slot + 1) & (capacity - 1)
 			}
 		}
 	}
-	for _, ref := range slots {
-		if ref > 0 {
-			e := input.rows[(ref-1)/blockSize][(ref-1)%blockSize].event
-			if e.person != 0 {
+	// Stream the winners in input order. The hash table is never used to
+	// revisit each unique event through an unrelated memory address.
+	for _, block := range input.rows {
+		for _, row := range block {
+			if row.person != 0 {
+				e := row.event
+				e.person = a.person(e.person)
 				output[bucketFor(e.person)].add(e)
 			}
 		}
@@ -165,9 +180,8 @@ func dedup(input blocks[candidate], output *partition[event]) {
 
 func readClicks(dir string, workers int, w window, ids *identities, a aliases, cat catalog) ([]partition[click], error) {
 	result := make([]partition[click], workers)
-	err := scanParts(dir, workers, func(worker int, line string) {
-		var f [4]string
-		if !fields(line, f[:]) || f[0] == "" || f[1] == "" {
+	err := scanParts(dir, workers, 4, func(worker int, f []string) {
+		if f[0] == "" || f[1] == "" {
 			return
 		}
 		ts, ok := timestamp(f[3])
@@ -176,7 +190,7 @@ func readClicks(dir string, workers int, w window, ids *identities, a aliases, c
 			return
 		}
 		person := a.person(ids.key(f[1]))
-		result[worker][bucketFor(person)].add(click{person, ts, ids.key(f[0]), campaign})
+		result[worker][bucketFor(person)].add(click{person, touchpoint{ts, ids.key(f[0]), campaign}})
 	})
 	return result, err
 }

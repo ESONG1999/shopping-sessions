@@ -19,7 +19,7 @@ build:
 
 native: $(BIN)
 
-$(BIN): $(wildcard *.go) go.mod go.sum
+$(BIN): $(wildcard *.go *.s) go.mod go.sum
 	mkdir -p .build
 	CGO_ENABLED=0 $(GO) build -trimpath -o $@ .
 

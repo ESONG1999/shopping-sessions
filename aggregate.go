@@ -33,29 +33,44 @@ type campaignTotals struct {
 	credited, purchasing, revenue, assisted int64
 }
 
+func (total *campaignTotals) add(delta campaignTotals) {
+	total.credited += delta.credited
+	total.purchasing += delta.purchasing
+	total.revenue += delta.revenue
+	total.assisted += delta.assisted
+}
+
 type activeCampaign struct {
 	last, firstSession, position int
 }
 
 type attribution struct {
 	sums   map[campaignDay]campaignTotals
+	dense  []campaignTotals
 	states []activeCampaign
 	active []uint32
-	clicks []click
+	clicks []touchpoint
 
-	day             int32
+	firstDay, day   int32
+	dayOffset       int
 	lower, upper    int
 	sessionsThisDay int
 }
 
 func (a *attribution) record(campaign uint32, delta campaignTotals) {
+	if a.dense != nil {
+		a.dense[a.dayOffset+int(campaign)].add(delta)
+		return
+	}
 	key := campaignDay{campaign, a.day}
 	total := a.sums[key]
-	total.credited += delta.credited
-	total.purchasing += delta.purchasing
-	total.revenue += delta.revenue
-	total.assisted += delta.assisted
+	total.add(delta)
 	a.sums[key] = total
+}
+
+func (a *attribution) setDay(day int32) {
+	a.day = day
+	a.dayOffset = int(int64(day)-int64(a.firstDay)) * len(a.states)
 }
 
 func (a *attribution) countAssists(campaign uint32) {
@@ -122,69 +137,101 @@ func (a *attribution) session(start, revenue int64) {
 }
 
 type aggregator struct {
-	userRows *tableWriter[userDaily]
-	ids      *identities
-	names    []string
-	revenue  []int64
-	touched  []uint32
-	ads      attribution
+	userRows    *tableWriter[userDaily]
+	ids         *identities
+	names       []string
+	revenue     []int64
+	touched     []uint32
+	timeScratch []activity
+	ads         attribution
 }
 
-func (agg *aggregator) process(events []event, clicks []click) error {
-	if len(events) == 0 {
+type personSpan struct {
+	id             uint64
+	events, clicks int
+}
+
+func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error {
+	if events.size == 0 {
 		return nil
 	}
-	slices.SortFunc(events, func(a, b event) int {
-		if a.person != b.person {
-			return cmp.Compare(a.person, b.person)
+	// Count both inputs by person. After the prefix sums, the same fields
+	// act as write cursors into compact, contiguous spans.
+	index := make(map[uint64]int, events.size/32)
+	spans := []personSpan{{}}
+	for _, block := range events.rows {
+		for _, row := range block {
+			i := index[row.person]
+			if i == 0 {
+				i = len(spans)
+				index[row.person] = i
+				spans = append(spans, personSpan{id: row.person})
+			}
+			spans[i].events++
 		}
-		return cmp.Compare(a.ts, b.ts)
-	})
-	slices.SortFunc(clicks, func(a, b click) int {
-		if a.person != b.person {
-			return cmp.Compare(a.person, b.person)
+	}
+	for _, block := range clicks.rows {
+		for _, row := range block {
+			spans[index[row.person]].clicks++
 		}
-		if a.ts != b.ts {
-			return cmp.Compare(a.ts, b.ts)
+	}
+	eventCount, clickCount := 0, 0
+	for i := 1; i < len(spans); i++ {
+		span := &spans[i]
+		span.events, eventCount = eventCount, eventCount+span.events
+		span.clicks, clickCount = clickCount, clickCount+span.clicks
+	}
+	eventRows := make([]activity, eventCount)
+	clickRows := make([]touchpoint, clickCount)
+	for _, block := range events.rows {
+		for _, row := range block {
+			span := &spans[index[row.person]]
+			eventRows[span.events] = row.activity
+			span.events++
 		}
-		// Put the smallest ID last so the last qualifying click wins.
-		if agg.ids.less(b.id, a.id) {
-			return -1
+	}
+	for _, block := range clicks.rows {
+		for _, row := range block {
+			if i := index[row.person]; i != 0 {
+				span := &spans[i]
+				clickRows[span.clicks] = row.touchpoint
+				span.clicks++
+			}
 		}
-		if agg.ids.less(a.id, b.id) {
-			return 1
-		}
-		return 0
-	})
-	clicks = slices.CompactFunc(clicks, func(a, b click) bool { return a.id == b.id })
+	}
 
-	clickAt := 0
-	for start := 0; start < len(events); {
-		person := events[start].person
-		end := start + 1
-		for end < len(events) && events[end].person == person {
-			end++
+	eventAt, clickAt := 0, 0
+	for _, span := range spans[1:] {
+		personEvents := agg.sortActivity(eventRows[eventAt:span.events])
+		personClicks := clickRows[clickAt:span.clicks]
+		if len(personClicks) > 1 {
+			slices.SortFunc(personClicks, agg.compareClicks)
+			personClicks = slices.CompactFunc(personClicks, func(a, b touchpoint) bool { return a.id == b.id })
 		}
-		for clickAt < len(clicks) && clicks[clickAt].person < person {
-			clickAt++
-		}
-		clickEnd := clickAt
-		for clickEnd < len(clicks) && clicks[clickEnd].person == person {
-			clickEnd++
-		}
-		if err := agg.person(events[start:end], clicks[clickAt:clickEnd]); err != nil {
+		if err := agg.person(span.id, personEvents, personClicks); err != nil {
 			return err
 		}
-		start, clickAt = end, clickEnd
+		eventAt, clickAt = span.events, span.clicks
 	}
 	return nil
 }
 
-func (agg *aggregator) person(events []event, clicks []click) error {
-	name := agg.ids.name(events[0].person)
+func (agg *aggregator) compareClicks(a, b touchpoint) int {
+	if a.ts != b.ts {
+		return cmp.Compare(a.ts, b.ts)
+	}
+	// Put the smallest ID last so the last qualifying click wins.
+	if (a.id|b.id)&externalID == 0 {
+		return cmp.Compare(b.id, a.id)
+	}
+	return cmp.Compare(agg.ids.name(b.id), agg.ids.name(a.id))
+}
+
+func (agg *aggregator) person(id uint64, events []activity, clicks []touchpoint) error {
+	name := agg.ids.name(id)
 	day := int32(floorDiv(events[0].ts, dayMillis))
 	row := userDaily{UserID: name, Day: day}
-	agg.ads.day = day
+	agg.ads.setDay(day)
 	agg.ads.clicks = clicks
 	for start := 0; start < len(events); {
 		ts := events[start].ts
@@ -194,7 +241,7 @@ func (agg *aggregator) person(events []event, clicks []click) error {
 				return err
 			}
 			agg.ads.finishDay()
-			agg.ads.day = day
+			agg.ads.setDay(day)
 			row = userDaily{UserID: name, Day: day}
 		}
 
