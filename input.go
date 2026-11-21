@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,8 +36,9 @@ func readWindow(dir string) (window, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return window{}, fmt.Errorf("manifest: %w", err)
 	}
-	start, startOK := timestamp(manifest.Start)
-	end, endOK := timestamp(manifest.End)
+	var decoder timestampDecoder
+	start, startOK := decoder.timestamp(manifest.Start)
+	end, endOK := decoder.timestamp(manifest.End)
 	if !startOK || !endOK || end <= start {
 		return window{}, fmt.Errorf("invalid manifest window")
 	}
@@ -120,6 +120,10 @@ func scanParts(dir string, workers, width int, visit func(int, []string)) error 
 	if err != nil {
 		return err
 	}
+	return scanPaths(paths, workers, width, visit)
+}
+
+func scanPaths(paths []string, workers, width int, visit func(int, []string)) error {
 	var mappings [][]byte
 	defer func() {
 		for _, data := range mappings {
@@ -192,73 +196,6 @@ func asciiNumber(s string, limit int64) (int64, bool) {
 		value = 10*value + d
 	}
 	return value, true
-}
-
-func twoDigits(a, b byte) int64 {
-	a, b = a-'0', b-'0'
-	if a > 9 || b > 9 {
-		return -1
-	}
-	return 10*int64(a) + int64(b)
-}
-
-func timestamp(s string) (int64, bool) {
-	if len(s) >= 5 && s[4] == '-' {
-		return calendarTimestamp(s)
-	}
-	return asciiNumber(s, math.MaxInt64)
-}
-
-func calendarTimestamp(s string) (int64, bool) {
-	if len(s) != 20 && len(s) != 25 {
-		return 0, false
-	}
-	if s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' {
-		return 0, false
-	}
-	century, yy := twoDigits(s[0], s[1]), twoDigits(s[2], s[3])
-	month, day := twoDigits(s[5], s[6]), twoDigits(s[8], s[9])
-	hour, minute, second := twoDigits(s[11], s[12]), twoDigits(s[14], s[15]), twoDigits(s[17], s[18])
-	if century < 0 || yy < 0 || month < 1 || month > 12 || day < 1 ||
-		hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 {
-		return 0, false
-	}
-	year := century*100 + yy
-	leap := year%4 == 0 && (yy != 0 || century%4 == 0)
-	monthLength := [...]int64{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
-	lastDay := monthLength[month-1]
-	if month == 2 && leap {
-		lastDay++
-	}
-	if day > lastDay {
-		return 0, false
-	}
-	var offset int64
-	if len(s) == 20 {
-		if s[19] != 'Z' {
-			return 0, false
-		}
-	} else {
-		oh, om := twoDigits(s[20], s[21]), twoDigits(s[23], s[24])
-		if (s[19] != '+' && s[19] != '-') || s[22] != ':' ||
-			oh < 0 || oh > 23 || om < 0 || om > 59 {
-			return 0, false
-		}
-		offset = 60*oh + om
-		if s[19] == '-' {
-			offset = -offset
-		}
-	}
-	// Day zero is 1970-01-01. Count leap days before the given year.
-	completeYears := year - 1
-	days := completeYears*365 + floorDiv(completeYears, 4) -
-		floorDiv(completeYears, 100) + floorDiv(completeYears, 400) - 719162
-	beforeMonth := [...]int64{0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}
-	days += beforeMonth[month-1] + day - 1
-	if leap && month > 2 {
-		days++
-	}
-	return ((days*24+hour)*3600 + (minute-offset)*60 + second) * 1000, true
 }
 
 func floorDiv(value, divisor int64) int64 {

@@ -1,6 +1,6 @@
 #include "textflag.h"
 
-// One mask pair per 32 bytes. The caller supplies at least one complete block.
+// Three masks per 32 bytes. The caller supplies at least one complete block.
 TEXT ·fillCSVMasksAVX2(SB), NOSPLIT, $0-40
 	MOVQ text_base+0(FP), SI
 	MOVQ masks_base+16(FP), DI
@@ -20,13 +20,15 @@ next:
 	VPCMPEQB Y1, Y0, Y4
 	VPCMPEQB Y2, Y0, Y5
 	VPOR Y4, Y5, Y4
+	VPMOVMSKB Y5, R8
 	VPCMPEQB Y3, Y0, Y5
 	VPMOVMSKB Y4, AX
 	VPMOVMSKB Y5, DX
 	MOVL AX, (DI)
 	MOVL DX, 4(DI)
+	MOVL R8, 8(DI)
 	ADDQ $32, SI
-	ADDQ $8, DI
+	ADDQ $12, DI
 	DECQ CX
 	JNZ next
 	VZEROUPPER

@@ -143,6 +143,7 @@ type aggregator struct {
 	revenue     []int64
 	touched     []uint32
 	timeScratch []activity
+	rowGroups   []uint32
 	ads         attribution
 }
 
@@ -159,6 +160,12 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	// act as write cursors into compact, contiguous spans.
 	index := make(map[uint64]int, events.size/32)
 	spans := []personSpan{{}}
+	n := events.size + clicks.size
+	if cap(agg.rowGroups) < n {
+		agg.rowGroups = make([]uint32, n)
+	}
+	groups := agg.rowGroups[:n]
+	at := 0
 	for _, block := range events.rows {
 		for _, row := range block {
 			i := index[row.person]
@@ -168,11 +175,16 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 				spans = append(spans, personSpan{id: row.person})
 			}
 			spans[i].events++
+			groups[at] = uint32(i)
+			at++
 		}
 	}
 	for _, block := range clicks.rows {
 		for _, row := range block {
-			spans[index[row.person]].clicks++
+			i := index[row.person]
+			spans[i].clicks++
+			groups[at] = uint32(i)
+			at++
 		}
 	}
 	eventCount, clickCount := 0, 0
@@ -183,20 +195,23 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	}
 	eventRows := make([]activity, eventCount)
 	clickRows := make([]touchpoint, clickCount)
+	at = 0
 	for _, block := range events.rows {
 		for _, row := range block {
-			span := &spans[index[row.person]]
+			span := &spans[groups[at]]
 			eventRows[span.events] = row.activity
 			span.events++
+			at++
 		}
 	}
 	for _, block := range clicks.rows {
 		for _, row := range block {
-			if i := index[row.person]; i != 0 {
+			if i := groups[at]; i != 0 {
 				span := &spans[i]
 				clickRows[span.clicks] = row.touchpoint
 				span.clicks++
 			}
+			at++
 		}
 	}
 

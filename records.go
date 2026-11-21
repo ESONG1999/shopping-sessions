@@ -41,13 +41,10 @@ func takeBlocks[T any](workers []partition[T], bucket int) blocks[T] {
 }
 
 func mix(key uint64) uint64 {
+	// Odd multiplication and right xorshift are each reversible on uint64.
 	key = (key ^ key>>30) * 0xbf58476d1ce4e5b9
 	key = (key ^ key>>27) * 0x94d049bb133111eb
 	return key ^ key>>31
-}
-
-func bucketFor(key uint64) int {
-	return int(mix(key) & (bucketCount - 1))
 }
 
 type event struct {
@@ -62,9 +59,59 @@ type activity struct {
 }
 
 type candidate struct {
-	id     uint64
-	ingest int64
-	event
+	key            uint64
+	person         uint64
+	timeCategory   uint64
+	ingestAndPrice uint64
+}
+
+const (
+	candidatePriceBits = 24
+	candidateTimeBits  = 48
+	candidateWide      = uint64(1) << 63
+	ingestBias         = int64(1) << 38
+)
+
+type candidateInput struct {
+	byKey []partition[candidate]
+	wide  [][]activity
+	start int64
+}
+
+func (in *candidateInput) add(worker int, key uint64, ingest int64, e event) {
+	// The four-digit calendar fits in 39 signed seconds. Biasing the
+	// seconds leaves room for the price and an overflow flag.
+	row := candidate{
+		key:            key,
+		person:         e.person,
+		ingestAndPrice: uint64(ingest/1000+ingestBias)<<candidatePriceBits | uint64(e.cents),
+	}
+	if e.person != 0 {
+		delta := uint64(e.ts) - uint64(in.start)
+		if delta>>candidateTimeBits == 0 && e.category>>16 == 0 {
+			row.timeCategory = uint64(e.category)<<candidateTimeBits | delta
+		} else {
+			row.ingestAndPrice |= candidateWide
+			row.timeCategory = uint64(worker)<<32 | uint64(len(in.wide[worker]))
+			in.wide[worker] = append(in.wide[worker], e.activity)
+		}
+	}
+	in.byKey[worker][key&(bucketCount-1)].add(row)
+}
+
+func (row candidate) ingestOrder() uint64 {
+	return (row.ingestAndPrice &^ candidateWide) >> candidatePriceBits
+}
+
+func (in candidateInput) activity(row candidate) activity {
+	if row.ingestAndPrice&candidateWide != 0 {
+		return in.wide[row.timeCategory>>32][uint32(row.timeCategory)]
+	}
+	return activity{
+		ts:       in.start + int64(row.timeCategory&((1<<candidateTimeBits)-1)),
+		cents:    uint32(row.ingestAndPrice & ((1 << candidatePriceBits) - 1)),
+		category: uint32(row.timeCategory >> candidateTimeBits),
+	}
 }
 
 type click struct {
@@ -78,22 +125,28 @@ type touchpoint struct {
 	campaign uint32
 }
 
-func readEventCandidates(dir string, workers int, w window, ids *identities, cat catalog) ([]partition[candidate], error) {
-	raw := make([]partition[candidate], workers)
+func readEventCandidates(dir string, workers int, w window, ids *identities, cat catalog) (candidateInput, error) {
+	raw := candidateInput{
+		byKey: make([]partition[candidate], workers),
+		wide:  make([][]activity, workers),
+		start: w.start,
+	}
+	decoders := make([]timestampDecoder, workers)
 	if err := scanParts(dir, workers, 7, func(worker int, f []string) {
 		if f[0] == "" {
 			return
 		}
-		ingest, ok := calendarTimestamp(f[3])
+		decoder := &decoders[worker]
+		ingest, ok := decoder.calendar(f[3])
 		if !ok {
 			return
 		}
-		id := ids.key(f[0])
+		key := mix(ids.key(f[0]))
 		var e event
 		// Keep invalid candidates in the dedup table. The earliest copy can
 		// suppress a later valid copy, so a zero person marks an invalid winner.
 		if f[1] != "" && f[5] != "" {
-			ts, tsOK := timestamp(f[2])
+			ts, tsOK := decoder.timestamp(f[2])
 			if tsOK && w.start <= ts && ts < w.end && ingest-ts <= dayMillis {
 				switch f[4] {
 				case "view", "cart":
@@ -112,22 +165,22 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 				}
 			}
 		}
-		raw[worker][bucketFor(id)].add(candidate{id, ingest, e})
+		raw.add(worker, key, ingest, e)
 	}); err != nil {
-		return nil, err
+		return candidateInput{}, err
 	}
 	return raw, nil
 }
 
-func deduplicate(raw []partition[candidate], workers int, a aliases) []partition[event] {
+func deduplicate(raw candidateInput, workers int, a aliases) []partition[event] {
 	byPerson := make([]partition[event], workers)
 	parallel(workers, bucketCount, func(worker, bucket int) {
-		dedup(takeBlocks(raw, bucket), a, &byPerson[worker])
+		dedup(takeBlocks(raw.byKey, bucket), raw, a, &byPerson[worker])
 	})
 	return byPerson
 }
 
-func dedup(input blocks[candidate], a aliases, output *partition[event]) {
+func dedup(input blocks[candidate], raw candidateInput, a aliases, output *partition[event]) {
 	if input.size == 0 {
 		return
 	}
@@ -139,7 +192,7 @@ func dedup(input blocks[candidate], a aliases, output *partition[event]) {
 		for i := range block {
 			row := &block[i]
 			ref := uint64(blockNo*blockSize + i + 1)
-			hash := mix(row.id) >> bucketBits
+			hash := row.key >> bucketBits
 			fingerprint := hash & 0xffffffff00000000
 			slot := int(hash) & (capacity - 1)
 			for {
@@ -151,8 +204,8 @@ func dedup(input blocks[candidate], a aliases, output *partition[event]) {
 				if old&0xffffffff00000000 == fingerprint {
 					index := uint32(old) - 1
 					previous := &input.rows[index/blockSize][index%blockSize]
-					if row.id == previous.id {
-						if row.ingest < previous.ingest {
+					if row.key == previous.key {
+						if row.ingestOrder() < previous.ingestOrder() {
 							slots[slot] = fingerprint | ref
 							previous.person = 0
 						} else {
@@ -170,9 +223,8 @@ func dedup(input blocks[candidate], a aliases, output *partition[event]) {
 	for _, block := range input.rows {
 		for _, row := range block {
 			if row.person != 0 {
-				e := row.event
-				e.person = a.person(e.person)
-				output[bucketFor(e.person)].add(e)
+				person, bucket := a.personBucket(row.person)
+				output[bucket].add(event{person, raw.activity(row)})
 			}
 		}
 	}
@@ -180,17 +232,18 @@ func dedup(input blocks[candidate], a aliases, output *partition[event]) {
 
 func readClicks(dir string, workers int, w window, ids *identities, a aliases, cat catalog) ([]partition[click], error) {
 	result := make([]partition[click], workers)
+	decoders := make([]timestampDecoder, workers)
 	err := scanParts(dir, workers, 4, func(worker int, f []string) {
 		if f[0] == "" || f[1] == "" {
 			return
 		}
-		ts, ok := timestamp(f[3])
+		ts, ok := decoders[worker].timestamp(f[3])
 		campaign := cat.campaignIDs[f[2]]
 		if !ok || ts < w.start-clickLookback || ts >= w.end || campaign == 0 {
 			return
 		}
-		person := a.person(ids.key(f[1]))
-		result[worker][bucketFor(person)].add(click{person, touchpoint{ts, ids.key(f[0]), campaign}})
+		person, bucket := a.personBucket(ids.key(f[1]))
+		result[worker][bucket].add(click{person, touchpoint{ts, ids.key(f[0]), campaign}})
 	})
 	return result, err
 }

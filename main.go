@@ -212,7 +212,7 @@ func run(data, out string, workers int) error {
 	pending.Add(1)
 	go func() {
 		defer pending.Done()
-		a, aliasErr = readAliases(filepath.Join(data, "links"), ids)
+		a, aliasErr = readAliases(filepath.Join(data, "links"), workers, ids)
 	}()
 	raw, err := readEventCandidates(filepath.Join(data, "events"), workers, w, ids, c)
 	pending.Wait()

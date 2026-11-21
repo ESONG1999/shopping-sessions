@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"slices"
@@ -100,16 +101,27 @@ type groupNode struct {
 }
 
 type groups struct {
-	index map[uint64]uint32
+	index aliases
 	nodes []groupNode
 }
 
 func (g *groups) add(key uint64) uint32 {
-	if i, ok := g.index[key]; ok {
-		return i
+	hash := mix(key)
+	pos := g.index.slot(hash)
+	if entry := g.index[pos]; entry.hash != 0 {
+		return uint32(entry.person)
+	}
+	if len(g.nodes)*2 == len(g.index) {
+		grown := make(aliases, len(g.index)*2)
+		for _, entry := range g.index {
+			if entry.hash != 0 {
+				grown[grown.slot(entry.hash)] = entry
+			}
+		}
+		g.index, pos = grown, grown.slot(hash)
 	}
 	i := uint32(len(g.nodes))
-	g.index[key] = i
+	g.index[pos] = aliasEntry{hash, uint64(i)}
 	g.nodes = append(g.nodes, groupNode{parent: i, size: 1, name: key})
 	return i
 }
@@ -138,31 +150,80 @@ func (g *groups) join(a, b uint64, ids *identities) {
 	}
 }
 
-type aliases map[uint64]uint64
+type aliasEntry struct {
+	hash   uint64
+	person uint64
+}
 
-func readAliases(dir string, ids *identities) (aliases, error) {
-	g := groups{index: make(map[uint64]uint32)}
-	if err := scanParts(dir, 1, 2, func(_ int, f []string) {
+type aliases []aliasEntry
+
+func (a aliases) slot(hash uint64) uint64 {
+	mask := uint64(len(a) - 1)
+	i := hash & mask
+	for a[i].hash != 0 && a[i].hash != hash {
+		i = (i + 1) & mask
+	}
+	return i
+}
+
+func readAliases(dir string, workers int, ids *identities) (aliases, error) {
+	paths, err := csvPaths(dir)
+	if err != nil {
+		return nil, err
+	}
+	var bytes int64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		bytes += info.Size()
+	}
+	// Estimate capacity from file sizes. Longer IDs, extra links, and small
+	// components only affect allocation, and the table grows if needed.
+	estimate := int(min(max(bytes/16, 32), 1<<22))
+	g := groups{
+		index: make(aliases, 1<<bits.Len(uint(2*estimate-1))),
+		nodes: make([]groupNode, 0, estimate),
+	}
+	if err := scanPaths(paths, 1, 2, func(_ int, f []string) {
 		if f[0] != "" && f[1] != "" {
 			g.join(ids.key(f[0]), ids.key(f[1]), ids)
 		}
 	}); err != nil {
 		return nil, err
 	}
-	result := make(aliases, len(g.index))
-	for key, i := range g.index {
-		if name := g.nodes[g.root(i)].name; name != key {
-			result[key] = name
-		}
+	if len(g.nodes) == 0 {
+		return nil, nil
 	}
-	return result, nil
+	// Finalize names in place. The graph is immutable during this pass, so
+	// each block can follow parent links without writing shared nodes.
+	const block = 16 << 10
+	parallel(workers, (len(g.index)+block-1)/block, func(_, job int) {
+		for i := job * block; i < min((job+1)*block, len(g.index)); i++ {
+			entry := &g.index[i]
+			if entry.hash != 0 {
+				n := uint32(entry.person)
+				for g.nodes[n].parent != n {
+					n = g.nodes[n].parent
+				}
+				entry.person = g.nodes[n].name
+			}
+		}
+	})
+	return g.index, nil
 }
 
-func (a aliases) person(key uint64) uint64 {
-	if name := a[key]; name != 0 {
-		return name
+func (a aliases) personBucket(key uint64) (uint64, int) {
+	hash := mix(key)
+	if len(a) != 0 {
+		entry := a[a.slot(hash)]
+		if entry.hash != 0 && entry.person != key {
+			key = entry.person
+			hash = mix(key)
+		}
 	}
-	return key
+	return key, int(hash & (bucketCount - 1))
 }
 
 type campaign struct {
