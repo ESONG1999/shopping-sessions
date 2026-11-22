@@ -209,42 +209,53 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 			}
 		}
 		decoder := &decoders[worker]
-		scanCSV(text, 7, func(f []string) {
-			if f[0] == "" {
-				return
-			}
-			ingest, ok := decoder.calendar(f[3])
-			if !ok {
-				return
-			}
-			row := inputEvent{key: mix(ids.key(f[0])), ingest: ingest}
-			// A validly structured row with invalid activity still takes
-			// part in deduplication, with no payload reference.
-			if f[1] != "" && f[5] != "" {
-				ts, tsOK := decoder.timestamp(f[2])
-				if tsOK && w.start <= ts && ts < w.end && ingest-ts <= dayMillis {
-					switch f[4] {
-					case "view", "cart":
-						row.user = ids.key(f[1])
-						row.ts = ts
-					case "purchase":
-						if price, priceOK := asciiNumber(f[6], 10_000_000); priceOK && price > 0 {
-							category, found := cat.products[f[5]]
-							if !found {
-								category = cat.unknown
-							}
-							row.user = ids.key(f[1])
-							row.activity = activity{ts: ts, cents: uint32(price), category: category}
-						}
-					}
-				}
-			}
+		if scanNativeEvents(text, decoder, w, ids, cat, func(row inputEvent) {
 			lane.add(row, raw.base)
+		}) {
+			return
+		}
+		scanCSV(text, 7, func(f []string) {
+			if row := parseEvent(decoder, f, w, ids, cat); row.key != 0 {
+				lane.add(row, raw.base)
+			}
 		})
 	}); err != nil {
 		return eventInput{}, err
 	}
 	return raw, nil
+}
+
+func parseEvent(decoder *timestampDecoder, f []string, w window, ids *identities, cat catalog) inputEvent {
+	if f[0] == "" {
+		return inputEvent{}
+	}
+	ingest, ok := decoder.calendar(f[3])
+	if !ok {
+		return inputEvent{}
+	}
+	row := inputEvent{key: mix(ids.key(f[0])), ingest: ingest}
+	// A validly structured row with invalid activity still takes
+	// part in deduplication, with no payload reference.
+	if f[1] != "" && f[5] != "" {
+		ts, tsOK := decoder.timestamp(f[2])
+		if tsOK && w.start <= ts && ts < w.end && (ingest <= ts || ingest-ts <= dayMillis) {
+			switch f[4] {
+			case "view", "cart":
+				row.user = ids.key(f[1])
+				row.ts = ts
+			case "purchase":
+				if price, priceOK := asciiNumber(f[6], 10_000_000); priceOK && price > 0 {
+					category, found := cat.products[f[5]]
+					if !found {
+						category = cat.unknown
+					}
+					row.user = ids.key(f[1])
+					row.activity = activity{ts: ts, cents: uint32(price), category: category}
+				}
+			}
+		}
+	}
+	return row
 }
 
 func deduplicate(raw *eventInput, workers int, a aliases) []partition[event] {

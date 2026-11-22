@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM --platform=$BUILDPLATFORM golang:1.25.5-bookworm@sha256:d9132cce84391efab786495288756d60e1da215b1f94e87860aeefc3d4c45b6d AS build
+FROM golang:1.25.5-bookworm@sha256:d9132cce84391efab786495288756d60e1da215b1f94e87860aeefc3d4c45b6d AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -7,8 +7,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go *.s ./
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /shopping-sessions .
+COPY internal/native/ ./internal/native/
+RUN CGO_ENABLED=1 CGO_CXXFLAGS_ALLOW="-m(avx2|popcnt|bmi)" GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -tags=nativecsv,netgo,osusergo -trimpath -ldflags="-linkmode=external -extldflags=-static -s -w" -o /shopping-sessions .
 
 FROM scratch
 COPY --from=build /shopping-sessions /shopping-sessions
