@@ -183,10 +183,11 @@ type aggregator struct {
 	names       []string
 	revenue     []int64
 	touched     []uint32
-	timeScratch []activity
+	codes       activityCodes
+	timeScratch []uint64
 	personIndex aliasTable
 	spans       []personSpan
-	eventRows   []activity
+	eventRows   []uint64
 	clickRows   []touchpoint
 	ads         attribution
 }
@@ -252,7 +253,7 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 		span.clicks, clickCount = clickCount, clickCount+span.clicks
 	}
 	if cap(agg.eventRows) < eventCount {
-		agg.eventRows = make([]activity, eventCount)
+		agg.eventRows = make([]uint64, eventCount)
 	}
 	if cap(agg.clickRows) < clickCount {
 		agg.clickRows = make([]touchpoint, clickCount)
@@ -266,7 +267,7 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 				continue
 			}
 			span := &spans[row.person]
-			eventRows[span.events] = row.activity
+			eventRows[span.events] = row.payload
 			span.events++
 		}
 	}
@@ -292,14 +293,14 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	return nil
 }
 
-func (agg *aggregator) person(id uint64, events []activity, clicks []touchpoint) error {
+func (agg *aggregator) person(id uint64, events []uint64, clicks []touchpoint) error {
 	name := agg.ids.name(id)
-	day := int32(floorDiv(events[0].ts, dayMillis))
+	day := int32(floorDiv(agg.codes.timestamp(events[0]), dayMillis))
 	row := userDaily{UserID: name, Day: day}
 	agg.ads.setDay(day)
 	agg.ads.clicks = clicks
 	for start := 0; start < len(events); {
-		ts := events[start].ts
+		ts := agg.codes.timestamp(events[start])
 		day = int32(floorDiv(ts, dayMillis))
 		if day != row.Day {
 			if err := agg.writeDay(row); err != nil {
@@ -313,7 +314,8 @@ func (agg *aggregator) person(id uint64, events []activity, clicks []touchpoint)
 		end := start
 		var revenue int64
 		for {
-			e := events[end]
+			payload := events[end]
+			e := agg.codes.unpack(payload)
 			if e.cents != 0 {
 				if agg.revenue[e.category] == 0 {
 					agg.touched = append(agg.touched, e.category)
@@ -322,7 +324,15 @@ func (agg *aggregator) person(id uint64, events []activity, clicks []touchpoint)
 				revenue += int64(e.cents)
 			}
 			end++
-			if end == len(events) || events[end].ts-events[end-1].ts > sessionGap {
+			if end == len(events) {
+				break
+			}
+			next := events[end]
+			if (next|payload)&wideActivity == 0 {
+				if (next>>32)-(payload>>32) > sessionGap {
+					break
+				}
+			} else if agg.codes.timestamp(next)-e.ts > sessionGap {
 				break
 			}
 		}

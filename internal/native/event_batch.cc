@@ -141,17 +141,28 @@ int64_t digits(field f, int64_t limit) {
     return value;
 }
 
+// Return -1 for a non-decimal byte.
+int32_t decimal8(uint64_t word) {
+    constexpr uint64_t upper = 0xf0f0f0f0f0f0f0f0, ascii = 0x3030303030303030;
+    if ((word & upper) != ascii || ((word + 0x0606060606060606) & upper) != ascii) return -1;
+    word -= ascii;
+    word = (10 * word + (word >> 8)) & 0x00ff00ff00ff00ff;
+    word = (100 * word + (word >> 16)) & 0x0000ffff0000ffff;
+    return static_cast<int32_t>(10000 * word + (word >> 32));
+}
+
 int64_t timestamp(field f, clock_decoder& decoder) {
     if (f.size >= 5 && f.ptr[4] == '-') return decoder.calendar(f);
     if (f.size < 8 || f.size > 18) return digits(f, INT64_MAX);
 
-    uint64_t word = load8(f.ptr);
-    constexpr uint64_t upper = 0xf0f0f0f0f0f0f0f0, ascii = 0x3030303030303030;
-    if ((word & upper) != ascii || ((word + 0x0606060606060606) & upper) != ascii) return INT64_MIN;
-    word -= ascii;
-    word = (10 * word + (word >> 8)) & 0x00ff00ff00ff00ff;
-    word = (100 * word + (word >> 16)) & 0x0000ffff0000ffff;
-    int64_t value = static_cast<uint32_t>(10000 * word + (word >> 32));
+    int64_t value = decimal8(load8(f.ptr));
+    if (value < 0) return INT64_MIN;
+    if (f.size == 13) {
+        // Load the trailing five digits with three leading zero digits.
+        constexpr uint64_t prefix = (uint64_t{1} << 24) - 1;
+        int32_t tail = decimal8((load8(f.ptr + 5) & ~prefix) | 0x303030);
+        return tail < 0 ? INT64_MIN : 100000 * value + tail;
+    }
     for (uint32_t i = 8; i < f.size; i++) {
         unsigned digit = static_cast<unsigned char>(f.ptr[i]) - '0';
         if (digit > 9) return INT64_MIN;
@@ -168,10 +179,11 @@ bool decode_event(const char* data, uint32_t start, const uint32_t* ends, int qu
     for (int column = 0; column < 7; column++) {
         const char* p = data + cursor;
         uint32_t len = ends[column] - cursor;
-        if (quotes != 0 && len >= 2 && p[0] == '"' && p[len - 1] == '"') {
-            p++;
-            len -= 2;
-            wrapped++;
+        if (quotes != 0 && len >= 2) {
+            unsigned trim = (p[0] == '"') & (p[len - 1] == '"');
+            p += trim;
+            len -= 2 * trim;
+            wrapped += trim;
         }
         fields[column] = {p, len};
         cursor = ends[column] + 1;

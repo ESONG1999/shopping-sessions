@@ -100,7 +100,7 @@ func prepareTable(dir string) error {
 	return nil
 }
 
-func writeTables(out string, workers int, events []partition[event], clicks clickInput, ids *identities, c catalog, w window) error {
+func writeTables(out string, workers int, events []partition[event], clicks clickInput, codes activityCodes, ids *identities, c catalog, w window) error {
 	userDir, campaignDir := filepath.Join(out, "user_daily"), filepath.Join(out, "campaign_daily")
 	if err := prepareTable(userDir); err != nil {
 		return err
@@ -124,6 +124,7 @@ func writeTables(out string, workers int, events []partition[event], clicks clic
 		defer writer.cleanup()
 		states[i] = aggregator{
 			userRows: writer,
+			codes:    codes,
 			ids:      ids,
 			names:    c.categories,
 			revenue:  make([]int64, len(c.categories)),
@@ -253,7 +254,7 @@ func run(data, out string, workers int) error {
 	}
 	fmt.Fprintf(os.Stderr, "event deduplication and click scan: %v\n", time.Since(stage).Round(time.Millisecond))
 	stage = time.Now()
-	if err := writeTables(out, workers, ev, cl, ids, c, w); err != nil {
+	if err := writeTables(out, workers, ev, cl, raw.activityCodes(w.start), ids, c, w); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "sessions, attribution and Parquet: %v (total: %v)\n",

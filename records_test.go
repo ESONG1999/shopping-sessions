@@ -8,11 +8,11 @@ func TestEventReferencesAcrossSlabs(t *testing.T) {
 	refs := make([]uint32, n)
 	for i := range refs {
 		person := uint64(i%bucketCount + 1)
-		refs[i] = store.append(person, activity{ts: int64(i)})
+		refs[i] = store.append(person, uint64(i)<<32)
 	}
 	for i, ref := range refs {
 		row := &store.slabs[(ref-1)/slabRows][(ref-1)%slabRows]
-		if row.ts != int64(i) || row.person != uint64(i%bucketCount+1) {
+		if row.payload>>32 != uint64(i) || row.person != uint64(i%bucketCount+1) {
 			t.Fatalf("reference %d resolved to the wrong row: %+v", ref, *row)
 		}
 		store.discard(ref)
@@ -52,7 +52,7 @@ func TestDedupKeepsDistinctIDsWithTheSameHashSlot(t *testing.T) {
 					if _, exists := got[person]; exists {
 						t.Fatalf("duplicate emitted for person %d", person)
 					}
-					got[person] = row.ts
+					got[person] = int64(row.payload >> 32)
 				}
 			}
 		}
@@ -79,7 +79,7 @@ func TestEarlyEventMovesToCanonicalBucket(t *testing.T) {
 			for _, row := range block {
 				if row.person != 0 {
 					live++
-					if row.person != canonical || row.ts != 25 || uint64(bucket) != canonical&(bucketCount-1) {
+					if row.person != canonical || row.payload>>32 != 25 || uint64(bucket) != canonical&(bucketCount-1) {
 						t.Fatalf("wrong row in bucket %d: %+v", bucket, row)
 					}
 				}

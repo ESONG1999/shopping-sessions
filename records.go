@@ -11,6 +11,10 @@ const (
 	blockSize   = 2048
 	slabBlocks  = 32
 	slabRows    = slabBlocks * blockSize
+
+	keyBucketBits  = 9
+	keyBucketCount = 1 << keyBucketBits
+	keyBlockSize   = 512
 )
 
 // Fixed-size blocks let workers partition rows without slice growth copying
@@ -72,8 +76,8 @@ func unmix(key uint64) uint64 {
 }
 
 type event struct {
-	person uint64
-	activity
+	person  uint64
+	payload uint64
 }
 
 type activity struct {
@@ -89,6 +93,26 @@ type eventKey struct {
 	timeRef uint64
 }
 
+type keyPartition struct {
+	buckets [keyBucketCount]blocks[eventKey]
+	spare   []eventKey
+}
+
+func (p *keyPartition) add(row eventKey) {
+	b := &p.buckets[row.key&(keyBucketCount-1)]
+	i := len(b.rows) - 1
+	if i < 0 || len(b.rows[i]) == keyBlockSize {
+		if len(p.spare) == 0 {
+			p.spare = make([]eventKey, slabRows)
+		}
+		b.rows = append(b.rows, p.spare[:0:keyBlockSize])
+		p.spare = p.spare[keyBlockSize:]
+		i++
+	}
+	b.rows[i] = append(b.rows[i], row)
+	b.size++
+}
+
 const (
 	extendedEvent = uint32(1) << 31
 	rawUserRef    = uint32(1) << 31
@@ -101,7 +125,7 @@ type eventStore struct {
 	next  [bucketCount]uint32
 }
 
-func (s *eventStore) append(person uint64, a activity) uint32 {
+func (s *eventStore) append(person, payload uint64) uint32 {
 	bucket := person & (bucketCount - 1)
 	b := &s.buckets[bucket]
 	i := len(b.rows) - 1
@@ -116,7 +140,7 @@ func (s *eventStore) append(person uint64, a activity) uint32 {
 	}
 	ref := s.next[bucket]
 	s.next[bucket]++
-	b.rows[i] = append(b.rows[i], event{person, a})
+	b.rows[i] = append(b.rows[i], event{person, payload})
 	b.size++
 	return ref
 }
@@ -141,11 +165,14 @@ type eventDetails struct {
 }
 
 type eventLane struct {
-	keys     partition[eventKey]
-	events   eventStore
-	rawUsers eventStore
-	details  []eventDetails
-	aliases  *aliases
+	keys           keyPartition
+	events         eventStore
+	rawUsers       eventStore
+	details        []eventDetails
+	aliases        *aliases
+	activityStart  int64
+	wideActivities []activity
+	worker         int
 }
 
 type eventInput struct {
@@ -168,11 +195,12 @@ func externalEventHash(id string) uint64 {
 func (lane *eventLane) add(row inputEvent, base int64) {
 	var ref uint32
 	if row.user != 0 {
+		payload := lane.packActivity(row.activity)
 		hash := mix(row.user)
 		if lane.aliases == nil {
-			ref = rawUserRef | lane.rawUsers.append(hash, row.activity)
+			ref = rawUserRef | lane.rawUsers.append(hash, payload)
 		} else {
-			ref = lane.events.append(lane.aliases.canonicalHash(hash), row.activity)
+			ref = lane.events.append(lane.aliases.canonicalHash(hash), payload)
 		}
 	}
 	ingest := row.ingest / 1000
@@ -182,7 +210,7 @@ func (lane *eventLane) add(row inputEvent, base int64) {
 		code = extendedEvent | uint32(len(lane.details))
 		lane.details = append(lane.details, eventDetails{row.id, ingest})
 	}
-	lane.keys.add(row.key&(bucketCount-1), eventKey{row.key, uint64(code)<<32 | uint64(ref)})
+	lane.keys.add(eventKey{row.key, uint64(code)<<32 | uint64(ref)})
 }
 
 func (lane *eventLane) discard(ref uint32) {
@@ -221,6 +249,10 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 		return eventInput{}, err
 	}
 	raw := eventInput{lanes: make([]eventLane, workers), base: w.start/1000 - ingestBias, input: mapped}
+	for i := range raw.lanes {
+		raw.lanes[i].activityStart = w.start
+		raw.lanes[i].worker = i
+	}
 	decoders := make([]timestampDecoder, workers)
 	mapped.scan(workers, func(worker int, text string) {
 		lane := &raw.lanes[worker]
@@ -285,7 +317,7 @@ func parseEvent(decoder *timestampDecoder, f []string, w window, ids *identities
 
 func deduplicate(raw *eventInput, workers int, a aliases) []partition[event] {
 	scratch := make([]dedupScratch, workers)
-	parallel(workers, bucketCount, func(worker, bucket int) {
+	parallel(workers, keyBucketCount, func(worker, bucket int) {
 		scratch[worker].dedup(raw, bucket)
 	})
 	out := make([]partition[event], len(raw.lanes))
@@ -304,7 +336,7 @@ func deduplicate(raw *eventInput, workers int, a aliases) []partition[event] {
 					if person&(bucketCount-1) == uint64(bucket) {
 						row.person = person
 					} else {
-						lane.events.append(person, row.activity)
+						lane.events.append(person, row.payload)
 						row.person = 0
 					}
 				}
@@ -355,14 +387,14 @@ func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
 	// The low bits point to a row (plus one, reserving zero for an empty
 	// slot). The remaining high bits screen probes before reading that row.
 	// Only the full key and original ID bytes can establish equality.
-	refBits := bits.Len(uint(len(s.blocks) * blockSize))
+	refBits := bits.Len(uint(len(s.blocks) * keyBlockSize))
 	fingerprintMask := ^uint32(0) << refBits
 	mask := capacity - 1
 	for blockNo, block := range s.blocks {
 		for i, row := range block.rows {
 			fingerprint := uint32(row.key>>32) & fingerprintMask
-			ref := fingerprint | uint32(blockNo*blockSize+i+1)
-			slot := int(row.key>>bucketBits) & mask
+			ref := fingerprint | uint32(blockNo*keyBlockSize+i+1)
+			slot := int(row.key>>keyBucketBits) & mask
 			for {
 				previous := s.slots[slot]
 				if previous == 0 {
@@ -371,8 +403,8 @@ func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
 				}
 				if previous&fingerprintMask == fingerprint {
 					old := (previous &^ fingerprintMask) - 1
-					oldBlock := s.blocks[old/blockSize]
-					earlier := oldBlock.rows[old%blockSize]
+					oldBlock := s.blocks[old/keyBlockSize]
+					earlier := oldBlock.rows[old%keyBlockSize]
 					if earlier.key != row.key {
 						slot = (slot + 1) & mask
 						continue
