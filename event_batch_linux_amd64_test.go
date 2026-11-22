@@ -39,7 +39,7 @@ func TestNativeEventBatchMatchesGo(t *testing.T) {
 
 	// Check alignment at all SIMD lane offsets, several output batch
 	// boundaries, and the last record without a newline.
-	for offset := range 32 {
+	for offset := range 64 {
 		input := strings.Repeat("x", offset) + "\n" + strings.Repeat(strings.Join(rows, "\n")+"\n", 75) + rows[0]
 		var want, got []inputEvent
 		var decoder timestampDecoder

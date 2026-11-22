@@ -139,8 +139,17 @@ func scanChunks(paths []string, workers int, visit func(int, string)) error {
 	return nil
 }
 
+type mappedMemory [][]byte
+
+func (m *mappedMemory) close() {
+	for _, data := range *m {
+		unix.Munmap(data)
+	}
+	*m = nil
+}
+
 type mappedChunks struct {
-	mappings [][]byte
+	mappings mappedMemory
 	jobs     []inputChunk
 }
 
@@ -171,10 +180,8 @@ func (input mappedChunks) scan(workers int, visit func(int, string)) {
 }
 
 func (input *mappedChunks) close() {
-	for _, data := range input.mappings {
-		unix.Munmap(data)
-	}
-	*input = mappedChunks{}
+	input.mappings.close()
+	input.jobs = nil
 }
 
 type inputChunk struct {

@@ -116,6 +116,7 @@ func (p *keyPartition) add(row eventKey) {
 const (
 	extendedEvent = uint32(1) << 31
 	rawUserRef    = uint32(1) << 31
+	directUserRef = uint32(1) << 30
 	ingestBias    = int64(1) << 30
 )
 
@@ -172,20 +173,31 @@ type eventLane struct {
 	aliases        *aliases
 	activityStart  int64
 	wideActivities []activity
+	directPayload  []event
 	worker         int
 }
 
 type eventInput struct {
-	lanes []eventLane
-	base  int64
-	input mappedChunks
+	lanes        []eventLane
+	base         int64
+	input        mappedChunks
+	directKeys   mappedMemory
+	directMemory mappedMemory
 }
 
 func (raw *eventInput) close() {
+	raw.closeInput()
+	raw.directMemory.close()
+}
+
+// Close the CSV and key buffers once deduplication no longer reads them.
+// The native event payloads are still used by aggregation.
+func (raw *eventInput) closeInput() {
 	for i := range raw.lanes {
 		raw.lanes[i].details = nil
 	}
 	raw.input.close()
+	raw.directKeys.close()
 }
 
 func externalEventHash(id string) uint64 {
@@ -214,7 +226,9 @@ func (lane *eventLane) add(row inputEvent, base int64) {
 }
 
 func (lane *eventLane) discard(ref uint32) {
-	if ref&rawUserRef != 0 {
+	if ref&directUserRef != 0 {
+		lane.directPayload[(ref&^(directUserRef|rawUserRef))-1].person = 0
+	} else if ref&rawUserRef != 0 {
 		lane.rawUsers.discard(ref &^ rawUserRef)
 	} else {
 		lane.events.discard(ref)
@@ -253,6 +267,7 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 		raw.lanes[i].activityStart = w.start
 		raw.lanes[i].worker = i
 	}
+	direct := allocateDirectLanes(mapped, workers)
 	decoders := make([]timestampDecoder, workers)
 	mapped.scan(workers, func(worker int, text string) {
 		lane := &raw.lanes[worker]
@@ -262,6 +277,9 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 				lane.aliases = a
 			default:
 			}
+		}
+		if direct != nil && direct[worker].scan(text, w, ids, cat, lane, raw.base) {
+			return
 		}
 		decoder := &decoders[worker]
 		if scanNativeEvents(text, w, ids, cat, func(row inputEvent) {
@@ -275,6 +293,9 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 			}
 		})
 	})
+	for worker := range direct {
+		direct[worker].publish(&raw, worker)
+	}
 	return raw, nil
 }
 
@@ -325,6 +346,8 @@ func deduplicate(raw *eventInput, workers int, a aliases) []partition[event] {
 		lane := &raw.lanes[i]
 		// Events parsed before the alias table was ready are already
 		// bucketed by original user. Only a bucket change needs a copy.
+		// Adjacent rows in a bucket often use the same original identity.
+		var resolved [2048]aliasEntry
 		for bucket, b := range lane.rawUsers.buckets {
 			for _, block := range b.rows {
 				for j := range block {
@@ -332,7 +355,12 @@ func deduplicate(raw *eventInput, workers int, a aliases) []partition[event] {
 					if row.person == 0 {
 						continue
 					}
-					person := a.canonicalHash(row.person)
+					hash := row.person
+					entry := &resolved[(hash>>bucketBits)&uint64(len(resolved)-1)]
+					if entry.hash != hash {
+						*entry = aliasEntry{hash, a.canonicalHash(hash)}
+					}
+					person := entry.person
 					if person&(bucketCount-1) == uint64(bucket) {
 						row.person = person
 					} else {

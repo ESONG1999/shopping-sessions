@@ -247,7 +247,7 @@ func run(data, out string, workers int) error {
 	fmt.Fprintf(os.Stderr, "catalogs, links and event scan: %v\n", time.Since(started).Round(time.Millisecond))
 	stage := time.Now()
 	ev := deduplicate(&raw, workers, a)
-	raw.close()
+	raw.closeInput()
 	<-clicksDone
 	if clickErr != nil {
 		return clickErr

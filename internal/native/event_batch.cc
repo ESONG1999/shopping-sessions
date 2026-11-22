@@ -171,8 +171,9 @@ int64_t timestamp(field f, clock_decoder& decoder) {
     return value;
 }
 
-bool decode_event(const char* data, uint32_t start, const uint32_t* ends, int quotes,
-                  int64_t from, int64_t until, clock_decoder& decoder, event_candidate& out) {
+template <typename Emit>
+inline bool decode_event(const char* data, uint32_t start, const uint32_t* ends, int quotes,
+                  int64_t from, int64_t until, clock_decoder& decoder, const Emit& emit, uint32_t index) {
     field fields[7];
     uint32_t cursor = start;
     int wrapped = 0;
@@ -191,31 +192,37 @@ bool decode_event(const char* data, uint32_t start, const uint32_t* ends, int qu
     if (wrapped * 2 != quotes || fields[0].size == 0) return false;
     int64_t ingest = decoder.calendar(fields[3]);
     if (ingest == INT64_MIN) return false;
-    out = {encode_id(data, fields[0]), 0, ingest, 0, 0, 0, 0};
-    if (fields[1].size == 0 || fields[5].size == 0) return true;
-    int64_t ts = timestamp(fields[2], decoder);
-    if (ts == INT64_MIN || ts < from || ts >= until || (ingest > ts && ingest - ts > day_ms)) return true;
-    field kind = fields[4];
-    if (kind.size == 4 &&
-        (std::memcmp(kind.ptr, "view", 4) == 0 || std::memcmp(kind.ptr, "cart", 4) == 0)) {
-        out.user = encode_id(data, fields[1]);
-        out.ts = ts;
-    } else if (kind.size == 8 && std::memcmp(kind.ptr, "purchase", 8) == 0) {
-        int64_t cents = digits(fields[6], 10000000);
-        if (cents <= 0) return true;
-        out.user = encode_id(data, fields[1]);
-        out.ts = ts;
-        out.product_offset = fields[5].ptr - data;
-        out.product_size = fields[5].size;
-        out.cents = static_cast<uint32_t>(cents);
+    uint64_t key = encode_id(data, fields[0]);
+    uint64_t user = 0;
+    int64_t event_ts = 0;
+    uint32_t product_offset = 0, product_size = 0, amount = 0;
+    if (fields[1].size != 0 && fields[5].size != 0) {
+        int64_t ts = timestamp(fields[2], decoder);
+        if (ts != INT64_MIN && ts >= from && ts < until && (ingest <= ts || ingest - ts <= day_ms)) {
+            field kind = fields[4];
+            if (kind.size == 4 &&
+                (std::memcmp(kind.ptr, "view", 4) == 0 || std::memcmp(kind.ptr, "cart", 4) == 0)) {
+                user = encode_id(data, fields[1]);
+                event_ts = ts;
+            } else if (kind.size == 8 && std::memcmp(kind.ptr, "purchase", 8) == 0) {
+                int64_t cents = digits(fields[6], 10000000);
+                if (cents > 0) {
+                    user = encode_id(data, fields[1]);
+                    event_ts = ts;
+                    product_offset = fields[5].ptr - data;
+                    product_size = fields[5].size;
+                    amount = static_cast<uint32_t>(cents);
+                }
+            }
+        }
     }
-    return true;
+    return emit(index, key, user, ingest, event_ts, product_offset, product_size, amount);
 }
 
-} // namespace
-
-extern "C" uint64_t event_batch(const char* data, uint32_t size, event_candidate* output,
-                                uint32_t capacity, int64_t start, int64_t end) {
+// The emitter reports whether a result occupies a slot in the return batch.
+template <typename Emit>
+uint64_t scan_event_batch(const char* data, uint32_t size, uint32_t capacity,
+                          int64_t start, int64_t end, Emit&& emit) {
     const __m256i comma_char = _mm256_set1_epi8(',');
     const __m256i quote_char = _mm256_set1_epi8('"');
     const __m256i newline_char = _mm256_set1_epi8('\n');
@@ -223,28 +230,33 @@ extern "C" uint64_t event_batch(const char* data, uint32_t size, event_candidate
     uint32_t ends[7];
     uint32_t row_start = 0, count = 0;
     unsigned columns = 0, row_quotes = 0;
-    for (uint32_t offset = 0; offset <= size; offset += 32) {
-        uint32_t commas = 0, quotes = 0, newlines = 0;
-        if (size - offset >= 32) {
-            __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + offset));
-            commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma_char));
-            quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote_char));
-            newlines = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, newline_char));
+    for (uint32_t offset = 0; offset <= size; offset += 64) {
+        uint64_t commas = 0, quotes = 0, newlines = 0;
+        if (size - offset >= 64) {
+            __m256i low = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + offset));
+            __m256i high = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + offset + 32));
+            auto mask = [low, high](__m256i match) {
+                return uint64_t(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(low, match)))) |
+                       uint64_t(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(high, match)))) << 32;
+            };
+            commas = mask(comma_char);
+            quotes = mask(quote_char);
+            newlines = mask(newline_char);
         } else {
             for (uint32_t i = offset; i < size; i++) {
-                uint32_t bit = 1U << (i - offset);
+                uint64_t bit = uint64_t{1} << (i - offset);
                 switch (data[i]) {
                 case ',':  commas |= bit; break;
                 case '"':  quotes |= bit; break;
                 case '\n': newlines |= bit; break;
                 }
             }
-            if (size != 0 && data[size - 1] != '\n') newlines |= 1U << (size - offset);
+            if (size != 0 && data[size - 1] != '\n') newlines |= uint64_t{1} << (size - offset);
         }
         while (newlines != 0) {
             unsigned bit_index = std::countr_zero(newlines);
-            uint32_t below = (1U << bit_index) - 1;
-            uint32_t fields = commas & below;
+            uint64_t below = (uint64_t{1} << bit_index) - 1;
+            uint64_t fields = commas & below;
             uint32_t row_end = offset + bit_index;
             if (columns + std::popcount(fields) == 6) {
                 while (fields) {
@@ -253,7 +265,7 @@ extern "C" uint64_t event_batch(const char* data, uint32_t size, event_candidate
                 }
                 ends[6] = row_end;
                 if (decode_event(data, row_start, ends, row_quotes + std::popcount(quotes & below),
-                                 start, end, decoder, output[count]) && ++count == capacity) {
+                                 start, end, decoder, emit, count) && ++count == capacity) {
                     uint32_t consumed = row_end < size ? row_end + 1 : size;
                     return (static_cast<uint64_t>(consumed) << 32) | count;
                 }
@@ -276,4 +288,100 @@ extern "C" uint64_t event_batch(const char* data, uint32_t size, event_candidate
         row_quotes += std::popcount(quotes);
     }
     return (static_cast<uint64_t>(size) << 32) | count;
+}
+
+
+constexpr uint32_t direct_ref = uint32_t{1} << 30;
+constexpr uint32_t raw_user_ref = uint32_t{1} << 31;
+constexpr uint64_t external_id = uint64_t{1} << 63;
+
+uint64_t mix_id(uint64_t key) {
+    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9;
+    key = (key ^ (key >> 27)) * 0x94d049bb133111eb;
+    return key ^ (key >> 31);
+}
+
+uint64_t canonical_user(uint64_t hash, const direct_alias* aliases, uint32_t count,
+                        const uint64_t* filter, uint32_t words) {
+    if (words != 0) {
+        uint64_t bits = (uint64_t{1} << ((hash >> 52) & 63)) | (uint64_t{1} << (hash >> 58));
+        if ((filter[(hash >> std::countr_zero(static_cast<unsigned>(direct_person_buckets))) & (words - 1)] & bits) == bits) {
+            uint64_t slot = hash & (count - 1);
+            for (;;) {
+                const auto& entry = aliases[slot];
+                if (entry.hash == hash) return entry.person;
+                if (entry.hash == 0) break;
+                slot = (slot + 1) & (count - 1);
+            }
+        }
+    }
+    return hash;
+}
+
+template <unsigned Rows>
+bool needs_block(uint32_t next) {
+    return next == 0 || ((next - 1) & (Rows - 1)) == 0;
+}
+
+template <unsigned Rows, typename Bucket>
+uint32_t take_row(uint32_t& next, uint32_t& blocks, Bucket* owners, Bucket bucket) {
+    if (needs_block<Rows>(next)) {
+        owners[blocks] = bucket;
+        next = blocks * Rows + 1;
+        ++blocks;
+    }
+    return next++;
+}
+
+} // namespace
+
+extern "C" uint64_t event_batch(const char* data, uint32_t size, event_candidate* output,
+                                uint32_t capacity, int64_t start, int64_t end) {
+    return scan_event_batch(data, size, capacity, start, end,
+        [output](uint32_t i, uint64_t key, uint64_t user, int64_t ingest, int64_t ts, uint32_t product, uint32_t length, uint32_t amount) {
+            output[i] = {key, user, ingest, ts, product, length, amount};
+            return true;
+        });
+}
+
+extern "C" uint64_t event_batch_direct(
+    const char* data, uint32_t size, event_candidate* output, uint32_t output_capacity,
+    int64_t start, int64_t end, int64_t ingest_base,
+    direct_state* state, direct_key* keys, direct_event* events,
+    uint16_t* key_owners, uint8_t* event_owners, uint32_t key_capacity, uint32_t event_capacity, uint8_t raw_users,
+    const direct_alias* aliases, uint32_t alias_count, const uint64_t* filter, uint32_t filter_words) {
+
+    return scan_event_batch(data, size, output_capacity, start, end,
+        [&](uint32_t i, uint64_t packed_key, uint64_t user, int64_t ingest_ms, int64_t ts,
+            uint32_t product, uint32_t length, uint32_t amount) {
+            const auto defer = [&] {
+                output[i] = {packed_key, user, ingest_ms, ts, product, length, amount};
+                return true;
+            };
+            const uint64_t ingest = static_cast<uint64_t>(ingest_ms / 1000) - static_cast<uint64_t>(ingest_base);
+            if (((packed_key | user) & external_id) || amount != 0 || ingest >= raw_user_ref) {
+                return defer();
+            }
+            uint64_t key = mix_id(packed_key);
+            uint16_t bucket = key & (direct_key_buckets - 1);
+            auto& key_next = state->key_next[bucket];
+            if (state->key_blocks == key_capacity && needs_block<direct_key_rows>(key_next)) return defer();
+
+            uint32_t ref = 0;
+            if (user != 0) {
+                uint64_t delta = static_cast<uint64_t>(ts) - static_cast<uint64_t>(start);
+                if (delta >= (uint64_t{1} << 31)) return defer();
+                uint64_t person = canonical_user(mix_id(user), aliases, alias_count, filter, filter_words);
+                uint8_t person_bucket = (person & (direct_person_buckets - 1)) |
+                                        (raw_users ? direct_person_buckets : 0);
+                auto& event_next = state->event_next[person_bucket];
+                if (state->event_blocks == event_capacity && needs_block<direct_person_rows>(event_next)) return defer();
+                uint32_t slot = take_row<direct_person_rows>(event_next, state->event_blocks, event_owners, person_bucket);
+                events[slot - 1] = {person, delta << 32};
+                ref = slot | direct_ref | (raw_users ? raw_user_ref : 0);
+            }
+            uint32_t slot = take_row<direct_key_rows>(key_next, state->key_blocks, key_owners, bucket);
+            keys[slot - 1] = {key, ingest << 32 | ref};
+            return false;
+        });
 }
