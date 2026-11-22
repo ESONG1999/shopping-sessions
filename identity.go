@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/maphash"
 	"math/bits"
 	"os"
 	"path/filepath"
@@ -12,19 +13,33 @@ import (
 )
 
 const (
-	packedBytes = 9
-	externalID  = uint64(1) << 63
+	packedBytes    = 9
+	externalID     = uint64(1) << 63
+	identityShards = 256
 )
+
+var identitySeed = maphash.MakeSeed()
 
 // Short ASCII IDs are encoded losslessly and retain their bytewise sort order.
 // All other IDs are interned by exact string equality.
 type identities struct {
+	shards [identityShards]identityShard
+}
+
+type identityShard struct {
 	mu       sync.RWMutex
 	extended map[string]uint64
 	names    []string
 }
 
 func (ids *identities) key(s string) uint64 {
+	if key := packIdentity(s); key != 0 || s == "" {
+		return key
+	}
+	return ids.intern(s)
+}
+
+func packIdentity(s string) uint64 {
 	if len(s) == 8 || len(s) == 9 {
 		const ones, high = 0x0101010101010101, 0x8080808080808080
 		word := binary.BigEndian.Uint64([]byte(s))
@@ -46,36 +61,39 @@ func (ids *identities) key(s string) uint64 {
 		for i := 0; i < len(s); i++ {
 			c := s[i]
 			if c == 0 || c >= 128 {
-				return ids.intern(s)
+				return 0
 			}
 			key = key<<7 | uint64(c)
 		}
 		return key << (7 * (packedBytes - len(s)))
 	}
-	return ids.intern(s)
+	return 0
 }
 
 func (ids *identities) intern(s string) uint64 {
-	ids.mu.Lock()
-	defer ids.mu.Unlock()
-	if key, ok := ids.extended[s]; ok {
+	index := maphash.String(identitySeed, s) & (identityShards - 1)
+	shard := &ids.shards[index]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if key, ok := shard.extended[s]; ok {
 		return key
 	}
-	if ids.extended == nil {
-		ids.extended = make(map[string]uint64)
+	if shard.extended == nil {
+		shard.extended = make(map[string]uint64)
 	}
 	s = strings.Clone(s)
-	key := externalID | uint64(len(ids.names))
-	ids.extended[s] = key
-	ids.names = append(ids.names, s)
+	key := externalID | uint64(len(shard.names))*identityShards | index
+	shard.extended[s] = key
+	shard.names = append(shard.names, s)
 	return key
 }
 
 func (ids *identities) name(key uint64) string {
 	if key&externalID != 0 {
-		ids.mu.RLock()
-		name := ids.names[key&^externalID]
-		ids.mu.RUnlock()
+		shard := &ids.shards[key&(identityShards-1)]
+		shard.mu.RLock()
+		name := shard.names[(key&^externalID)/identityShards]
+		shard.mu.RUnlock()
 		return name
 	}
 	var buf [packedBytes]byte

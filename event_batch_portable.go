@@ -2,6 +2,6 @@
 
 package main
 
-func scanNativeEvents(string, *timestampDecoder, window, *identities, catalog, func(inputEvent)) bool {
+func scanNativeEvents(string, window, *identities, catalog, func(inputEvent)) bool {
 	return false
 }

@@ -11,8 +11,9 @@ struct event_candidate {
     uint64_t user;
     int64_t ingest;
     int64_t ts;
-    uint32_t offset;
-    uint32_t meta;
+    uint32_t product_offset;
+    uint32_t product_size;
+    uint32_t cents;
 };
 
 uint64_t event_batch(const char* data, uint32_t size, struct event_candidate* output,

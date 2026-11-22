@@ -130,31 +130,51 @@ func scanPaths(paths []string, workers, width int, visit func(int, []string)) er
 }
 
 func scanChunks(paths []string, workers int, visit func(int, string)) error {
-	var mappings [][]byte
-	defer func() {
-		for _, data := range mappings {
-			unix.Munmap(data)
-		}
-	}()
-	var jobs []inputChunk
+	input, err := mapChunks(paths)
+	if err != nil {
+		return err
+	}
+	defer input.close()
+	input.scan(workers, visit)
+	return nil
+}
+
+type mappedChunks struct {
+	mappings [][]byte
+	jobs     []inputChunk
+}
+
+func mapChunks(paths []string) (mappedChunks, error) {
+	var input mappedChunks
 	for _, path := range paths {
 		data, err := mapFile(path)
 		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
+			input.close()
+			return mappedChunks{}, fmt.Errorf("%s: %w", path, err)
 		}
 		if len(data) == 0 {
 			continue
 		}
-		mappings = append(mappings, data)
+		input.mappings = append(input.mappings, data)
 		text := unsafe.String(&data[0], len(data))
 		for start := 0; start < len(text); start += chunkBytes {
-			jobs = append(jobs, inputChunk{text, start, min(start+chunkBytes, len(text))})
+			input.jobs = append(input.jobs, inputChunk{text, start, min(start+chunkBytes, len(text))})
 		}
 	}
-	parallel(workers, len(jobs), func(worker, job int) {
-		visit(worker, jobs[job].records())
+	return input, nil
+}
+
+func (input mappedChunks) scan(workers int, visit func(int, string)) {
+	parallel(workers, len(input.jobs), func(worker, job int) {
+		visit(worker, input.jobs[job].records())
 	})
-	return nil
+}
+
+func (input *mappedChunks) close() {
+	for _, data := range input.mappings {
+		unix.Munmap(data)
+	}
+	*input = mappedChunks{}
 }
 
 type inputChunk struct {

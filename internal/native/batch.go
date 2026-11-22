@@ -12,13 +12,13 @@ import "C"
 
 import "unsafe"
 
-// Candidate mirrors event_candidate. Key zero refers to a raw row stored
-// as offset and length. Otherwise Meta holds the 24-bit price and 8-bit
-// product length, and Offset points to the product field.
+// Candidate mirrors event_candidate. Key and User hold packed IDs or, with
+// bit 63 set, the byte length and offset of an ID in the input batch.
 type Candidate struct {
-	Key, User    uint64
-	Ingest, TS   int64
-	Offset, Meta uint32
+	Key, User                  uint64
+	Ingest, TS                 int64
+	ProductOffset, ProductSize uint32
+	Cents                      uint32
 }
 
 const candidateSize = unsafe.Sizeof(C.struct_event_candidate{})

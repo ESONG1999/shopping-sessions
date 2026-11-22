@@ -90,3 +90,35 @@ func TestEarlyEventMovesToCanonicalBucket(t *testing.T) {
 		t.Fatalf("live rows = %d, want 1", live)
 	}
 }
+
+func TestDedupChecksExternalIDsOnHashCollision(t *testing.T) {
+	const hash = 1
+	raw := eventInput{lanes: make([]eventLane, 2), base: -ingestBias}
+	for _, row := range []inputEvent{
+		{key: hash, ingest: 4000, user: 1, activity: activity{ts: 1}},
+		{key: hash, id: "extended-event-A", ingest: 4000, user: 2, activity: activity{ts: 2}},
+		{key: hash, id: "extended-event-B", ingest: 5000, user: 3, activity: activity{ts: 3}},
+	} {
+		raw.lanes[0].add(row, raw.base)
+	}
+	// A malformed payload wins by ingest time and removes only its duplicate.
+	raw.lanes[1].add(inputEvent{key: hash, id: "extended-event-A", ingest: 1000}, raw.base)
+	// The same external key also collides with the packed ID.
+	raw.lanes[1].add(inputEvent{key: hash, id: "extended-event-B", ingest: 1000, user: 4, activity: activity{ts: 4}}, raw.base)
+	out := deduplicate(&raw, 2, aliases{})
+	survivors := make(map[uint64]bool)
+	for _, p := range out {
+		for _, b := range p.buckets {
+			for _, block := range b.rows {
+				for _, row := range block {
+					if row.person != 0 {
+						survivors[unmix(row.person)] = true
+					}
+				}
+			}
+		}
+	}
+	if len(survivors) != 2 || !survivors[1] || !survivors[4] {
+		t.Fatalf("wrong survivors after hash collision: %v", survivors)
+	}
+}

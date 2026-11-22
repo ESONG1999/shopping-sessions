@@ -235,6 +235,7 @@ func run(data, out string, workers int) error {
 		}
 	}()
 	raw, err := readEventCandidates(filepath.Join(data, "events"), workers, w, ids, c, &a, aliasesReady)
+	defer raw.close()
 	<-aliasesReady
 	if err := errors.Join(err, aliasErr); err != nil {
 		<-clicksDone
@@ -243,6 +244,7 @@ func run(data, out string, workers int) error {
 	fmt.Fprintf(os.Stderr, "catalogs, links and event scan: %v\n", time.Since(started).Round(time.Millisecond))
 	stage := time.Now()
 	ev := deduplicate(&raw, workers, a)
+	raw.close()
 	<-clicksDone
 	if clickErr != nil {
 		return clickErr

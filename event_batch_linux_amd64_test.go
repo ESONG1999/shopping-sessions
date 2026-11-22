@@ -47,7 +47,7 @@ func TestNativeEventBatchMatchesGo(t *testing.T) {
 				want = append(want, row)
 			}
 		})
-		if !scanNativeEvents(input, &decoder, window, ids, catalog, func(row inputEvent) {
+		if !scanNativeEvents(input, window, ids, catalog, func(row inputEvent) {
 			got = append(got, row)
 		}) {
 			t.Skip("AVX2 event parser unavailable")

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"hash/maphash"
 	"math/bits"
 )
 
@@ -81,17 +82,17 @@ type activity struct {
 	category uint32
 }
 
-// Each entry carries a full event ID and a reference into its worker's
-// person-partitioned payload slabs. Reference zero represents an invalid row.
+// Each entry carries a packed ID or a hash of an external ID and a reference
+// into its worker's payload slabs. Reference zero represents an invalid row.
 type eventKey struct {
 	key     uint64
 	timeRef uint64
 }
 
 const (
-	wideIngest = uint32(1) << 31
-	rawUserRef = uint32(1) << 31
-	ingestBias = int64(1) << 30
+	extendedEvent = uint32(1) << 31
+	rawUserRef    = uint32(1) << 31
+	ingestBias    = int64(1) << 30
 )
 
 type eventStore struct {
@@ -130,20 +131,38 @@ func (s *eventStore) discard(ref uint32) {
 type inputEvent struct {
 	key, user uint64
 	ingest    int64
+	id        string
 	activity
+}
+
+type eventDetails struct {
+	id     string
+	ingest int64
 }
 
 type eventLane struct {
 	keys     partition[eventKey]
 	events   eventStore
 	rawUsers eventStore
-	farTimes []int64
+	details  []eventDetails
 	aliases  *aliases
 }
 
 type eventInput struct {
 	lanes []eventLane
 	base  int64
+	input mappedChunks
+}
+
+func (raw *eventInput) close() {
+	for i := range raw.lanes {
+		raw.lanes[i].details = nil
+	}
+	raw.input.close()
+}
+
+func externalEventHash(id string) uint64 {
+	return max(1, maphash.String(identitySeed, id))
 }
 
 func (lane *eventLane) add(row inputEvent, base int64) {
@@ -159,9 +178,9 @@ func (lane *eventLane) add(row inputEvent, base int64) {
 	ingest := row.ingest / 1000
 	delta := uint64(ingest - base)
 	code := uint32(delta)
-	if delta >= uint64(wideIngest) {
-		code = wideIngest | uint32(len(lane.farTimes))
-		lane.farTimes = append(lane.farTimes, ingest)
+	if row.id != "" || delta >= uint64(extendedEvent) {
+		code = extendedEvent | uint32(len(lane.details))
+		lane.details = append(lane.details, eventDetails{row.id, ingest})
 	}
 	lane.keys.add(row.key&(bucketCount-1), eventKey{row.key, uint64(code)<<32 | uint64(ref)})
 }
@@ -174,11 +193,11 @@ func (lane *eventLane) discard(ref uint32) {
 	}
 }
 
-func (lane *eventLane) ingestTime(code uint32, base int64) int64 {
-	if code&wideIngest != 0 {
-		return lane.farTimes[code&^wideIngest]
+func (lane *eventLane) eventDetails(code uint32, base int64) eventDetails {
+	if code&extendedEvent != 0 {
+		return lane.details[code&^extendedEvent]
 	}
-	return base + int64(code)
+	return eventDetails{ingest: base + int64(code)}
 }
 
 type click struct {
@@ -197,9 +216,13 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 	if err != nil {
 		return eventInput{}, err
 	}
-	raw := eventInput{lanes: make([]eventLane, workers), base: w.start/1000 - ingestBias}
+	mapped, err := mapChunks(paths)
+	if err != nil {
+		return eventInput{}, err
+	}
+	raw := eventInput{lanes: make([]eventLane, workers), base: w.start/1000 - ingestBias, input: mapped}
 	decoders := make([]timestampDecoder, workers)
-	if err := scanChunks(paths, workers, func(worker int, text string) {
+	mapped.scan(workers, func(worker int, text string) {
 		lane := &raw.lanes[worker]
 		if lane.aliases == nil {
 			select {
@@ -209,7 +232,7 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 			}
 		}
 		decoder := &decoders[worker]
-		if scanNativeEvents(text, decoder, w, ids, cat, func(row inputEvent) {
+		if scanNativeEvents(text, w, ids, cat, func(row inputEvent) {
 			lane.add(row, raw.base)
 		}) {
 			return
@@ -219,9 +242,7 @@ func readEventCandidates(dir string, workers int, w window, ids *identities, cat
 				lane.add(row, raw.base)
 			}
 		})
-	}); err != nil {
-		return eventInput{}, err
-	}
+	})
 	return raw, nil
 }
 
@@ -233,7 +254,11 @@ func parseEvent(decoder *timestampDecoder, f []string, w window, ids *identities
 	if !ok {
 		return inputEvent{}
 	}
-	row := inputEvent{key: mix(ids.key(f[0])), ingest: ingest}
+	row := inputEvent{key: mix(packIdentity(f[0])), ingest: ingest}
+	if row.key == 0 {
+		row.key = externalEventHash(f[0])
+		row.id = f[0]
+	}
 	// A validly structured row with invalid activity still takes
 	// part in deduplication, with no payload reference.
 	if f[1] != "" && f[5] != "" {
@@ -354,9 +379,14 @@ func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
 					earlier := oldBlock.rows[old%blockSize]
 					t, last := uint32(row.timeRef>>32), uint32(earlier.timeRef>>32)
 					replace := t < last
-					if (t|last)&wideIngest != 0 {
-						replace = block.lane.ingestTime(t, raw.base) <
-							oldBlock.lane.ingestTime(last, raw.base)
+					if (t|last)&extendedEvent != 0 {
+						current := block.lane.eventDetails(t, raw.base)
+						prior := oldBlock.lane.eventDetails(last, raw.base)
+						if current.id != prior.id {
+							slot = (slot + 1) & mask
+							continue
+						}
+						replace = current.ingest < prior.ingest
 					}
 					if replace {
 						refs[slot] = ref

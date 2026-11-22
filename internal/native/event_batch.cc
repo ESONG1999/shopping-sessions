@@ -45,10 +45,12 @@ uint64_t pack_id(field f) {
     return key << (7 * (9 - f.size));
 }
 
-uint64_t mix(uint64_t key) {
-    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9;
-    key = (key ^ (key >> 27)) * 0x94d049bb133111eb;
-    return key ^ (key >> 31);
+uint64_t encode_id(const char* data, field id) {
+    if (uint64_t packed = pack_id(id)) return packed;
+    // The Go caller limits each batch's input to at most 1 GiB, so the
+    // high bit can mark a slice without hiding any length bits.
+    return (uint64_t{1} << 63) | (static_cast<uint64_t>(id.size) << 32) |
+           static_cast<uint32_t>(id.ptr - data);
 }
 
 int two_digits(const char* data) {
@@ -177,33 +179,23 @@ bool decode_event(const char* data, uint32_t start, const uint32_t* ends, int qu
     if (wrapped * 2 != quotes || fields[0].size == 0) return false;
     int64_t ingest = decoder.calendar(fields[3]);
     if (ingest == INT64_MIN) return false;
-    const auto fallback = [&] {
-        out = {0, 0, 0, 0, start, ends[6] - start};
-        return true;
-    };
-    uint64_t key = pack_id(fields[0]);
-    if (key == 0) return fallback();
-
-    out = {mix(key), 0, ingest, 0, 0, 0};
+    out = {encode_id(data, fields[0]), 0, ingest, 0, 0, 0, 0};
     if (fields[1].size == 0 || fields[5].size == 0) return true;
     int64_t ts = timestamp(fields[2], decoder);
     if (ts == INT64_MIN || ts < from || ts >= until || (ingest > ts && ingest - ts > day_ms)) return true;
     field kind = fields[4];
     if (kind.size == 4 &&
         (std::memcmp(kind.ptr, "view", 4) == 0 || std::memcmp(kind.ptr, "cart", 4) == 0)) {
-        uint64_t user = pack_id(fields[1]);
-        if (user == 0) return fallback();
-        out.user = user;
+        out.user = encode_id(data, fields[1]);
         out.ts = ts;
     } else if (kind.size == 8 && std::memcmp(kind.ptr, "purchase", 8) == 0) {
         int64_t cents = digits(fields[6], 10000000);
         if (cents <= 0) return true;
-        uint64_t user = pack_id(fields[1]);
-        if (user == 0 || fields[5].size > 255) return fallback();
-        out.user = user;
+        out.user = encode_id(data, fields[1]);
         out.ts = ts;
-        out.offset = fields[5].ptr - data;
-        out.meta = (fields[5].size << 24) | static_cast<uint32_t>(cents);
+        out.product_offset = fields[5].ptr - data;
+        out.product_size = fields[5].size;
+        out.cents = static_cast<uint32_t>(cents);
     }
     return true;
 }
