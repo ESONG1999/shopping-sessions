@@ -46,11 +46,13 @@ type activeCampaign struct {
 }
 
 type attribution struct {
-	sums   map[campaignDay]campaignTotals
-	dense  []campaignTotals
-	states []activeCampaign
-	active []uint32
-	clicks []touchpoint
+	sums     map[campaignDay]campaignTotals
+	dense    []campaignTotals
+	states   []activeCampaign
+	active   []uint32
+	clicks   []touchpoint
+	clickIDs *clickIDs
+	winner   int
 
 	firstDay, day   int32
 	dayOffset       int
@@ -99,11 +101,22 @@ func (a *attribution) finishPerson() {
 	a.clicks = nil
 }
 
+func (a *attribution) prefer(i, prior int) bool {
+	x, y := a.clicks[i], a.clicks[prior]
+	if x.ts != y.ts {
+		return x.ts > y.ts
+	}
+	return a.clickIDs.name(x.id) < a.clickIDs.name(y.id)
+}
+
 // The active set keeps the last click per campaign. Count a whole span of
 // assisted sessions on expiry or at a day boundary.
 func (a *attribution) session(start, revenue int64) {
 	for a.upper < len(a.clicks) && a.clicks[a.upper].ts <= start {
 		campaign := a.clicks[a.upper].campaign
+		if a.upper == 0 || a.prefer(a.upper, a.winner) {
+			a.winner = a.upper
+		}
 		a.upper++
 		state := &a.states[campaign]
 		if state.last == 0 {
@@ -127,8 +140,35 @@ func (a *attribution) session(start, revenue int64) {
 	}
 	var credited uint32
 	if a.upper > a.lower {
-		credited = a.clicks[a.upper-1].campaign
+		credited = a.clicks[a.winner].campaign
 	}
+	a.credit(credited, revenue)
+}
+
+func (a *attribution) singleSession(start, revenue int64) {
+	winner := -1
+	cutoff := start - clickLookback
+	for i, row := range a.clicks {
+		if row.ts < cutoff || row.ts > start {
+			continue
+		}
+		state := &a.states[row.campaign]
+		if state.last == 0 {
+			state.last = 1
+			a.active = append(a.active, row.campaign)
+		}
+		if winner < 0 || a.prefer(i, winner) {
+			winner = i
+		}
+	}
+	var credited uint32
+	if winner >= 0 {
+		credited = a.clicks[winner].campaign
+	}
+	a.credit(credited, revenue)
+}
+
+func (a *attribution) credit(credited uint32, revenue int64) {
 	purchasing := int64(0)
 	if revenue > 0 {
 		purchasing = 1
@@ -244,27 +284,12 @@ func (agg *aggregator) process(events blocks[event], clicks blocks[click]) error
 	for _, span := range spans[1:] {
 		personEvents := agg.sortActivity(eventRows[eventAt:span.events])
 		personClicks := clickRows[clickAt:span.clicks]
-		if len(personClicks) > 1 {
-			slices.SortFunc(personClicks, agg.compareClicks)
-			personClicks = slices.CompactFunc(personClicks, func(a, b touchpoint) bool { return a.id == b.id })
-		}
 		if err := agg.person(unmix(span.id), personEvents, personClicks); err != nil {
 			return err
 		}
 		eventAt, clickAt = span.events, span.clicks
 	}
 	return nil
-}
-
-func (agg *aggregator) compareClicks(a, b touchpoint) int {
-	if a.ts != b.ts {
-		return cmp.Compare(a.ts, b.ts)
-	}
-	// Put the smallest ID last so the last qualifying click wins.
-	if (a.id|b.id)&externalID == 0 {
-		return cmp.Compare(b.id, a.id)
-	}
-	return cmp.Compare(agg.ids.name(b.id), agg.ids.name(a.id))
 }
 
 func (agg *aggregator) person(id uint64, events []activity, clicks []touchpoint) error {
@@ -304,6 +329,17 @@ func (agg *aggregator) person(id uint64, events []activity, clicks []touchpoint)
 		row.Sessions++
 		row.Events += int64(end - start)
 		row.RevenueCents += revenue
+		// An identical copy of a click has the same winner and campaign
+		// membership, so it can pass through the attribution window.
+		if start == 0 {
+			if end == len(events) {
+				agg.ads.singleSession(ts, revenue)
+				break
+			}
+			if len(clicks) > 1 {
+				slices.SortFunc(clicks, func(a, b touchpoint) int { return cmp.Compare(a.ts, b.ts) })
+			}
+		}
 		agg.ads.session(ts, revenue)
 		start = end
 	}

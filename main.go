@@ -100,7 +100,7 @@ func prepareTable(dir string) error {
 	return nil
 }
 
-func writeTables(out string, workers int, events []partition[event], clicks []partition[click], ids *identities, c catalog, w window) error {
+func writeTables(out string, workers int, events []partition[event], clicks clickInput, ids *identities, c catalog, w window) error {
 	userDir, campaignDir := filepath.Join(out, "user_daily"), filepath.Join(out, "campaign_daily")
 	if err := prepareTable(userDir); err != nil {
 		return err
@@ -128,6 +128,7 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 			names:    c.categories,
 			revenue:  make([]int64, len(c.categories)),
 			ads: attribution{
+				clickIDs: &clicks.ids,
 				states:   make([]activeCampaign, campaignCount),
 				firstDay: int32(firstDay),
 			},
@@ -147,7 +148,7 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 	for bucket := range jobs {
 		jobs[bucket].bucket = bucket
 		for worker := range events {
-			jobs[bucket].rows += events[worker].buckets[bucket].size + clicks[worker].buckets[bucket].size
+			jobs[bucket].rows += events[worker].buckets[bucket].size + clicks.partitions[worker].buckets[bucket].size
 		}
 	}
 	// Schedule large buckets first to keep long user histories from
@@ -159,7 +160,7 @@ func writeTables(out string, workers int, events []partition[event], clicks []pa
 		}
 		bucket := jobs[job].bucket
 		ev := takeBlocks(events, bucket)
-		cl := takeBlocks(clicks, bucket)
+		cl := takeBlocks(clicks.partitions, bucket)
 		failures[worker] = states[worker].process(ev, cl)
 	})
 	if err := errors.Join(failures...); err != nil {
@@ -223,7 +224,8 @@ func run(data, out string, workers int) error {
 	ids := &identities{}
 	var a aliases
 	var aliasErr error
-	var cl []partition[click]
+	var cl clickInput
+	defer cl.close()
 	var clickErr error
 	aliasesReady, clicksDone := make(chan struct{}), make(chan struct{})
 	go func() {

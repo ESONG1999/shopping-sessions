@@ -28,21 +28,21 @@ The official checkers passed all 36 fixtures and matched both Parquet schemas an
 
 ## Local benchmark
 
-Both images ran with eight pinned vCPUs, a 24 GiB container limit, no swap, and read-only inputs from the `shopping-sessions-5` generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The 20-million-event warm result is the median of three interleaved runs per image. The cold result is the median of two pairs with reversed image order. The harness requested eviction of the input files from the guest page cache before each cold run. The 60-million-event result is a single pair using the same host-shared mount for both images.
+Both images ran with eight pinned vCPUs, a 24 GiB container limit, no swap, and read-only inputs from the `shopping-sessions-5` generator. Wall time includes startup in a local Linux VM running amd64 through Rosetta on an Apple M1 Max. The 20-million-event warm result is the median of three interleaved runs per image. Each of the other results is the median of two pairs with reversed image order. The harness requested eviction of the input files from the guest page cache before each cold run. Both images used the same host-shared mount for the 60-million-event runs.
 
-| Seed | Events | Clicks | Cache | Previous wall time (`ee25e74`) | Optimized wall time | Optimized cgroup peak |
+| Seed | Events | Clicks | Cache | Previous wall time (`e9e497c`) | Optimized wall time | Optimized cgroup peak |
 | --- | ---: | ---: | --- | ---: | ---: | ---: |
-| 22 | 20 million | 5 million | Warm | 11.97 s | 2.34 s | 1.71 GiB |
-| 22 | 20 million | 5 million | Cold | 12.92 s | 2.39 s | 3.58 GiB |
-| 42 | 60 million | 15 million | Warm, host-shared mount | 52.19 s | 18.00 s | 10.61 GiB |
+| 22 | 20 million | 5 million | Warm | 1.92 s | 1.90 s | 1.63 GiB |
+| 22 | 20 million | 5 million | Cold | 2.12 s | 2.06 s | 3.52 GiB |
+| 42 | 60 million | 15 million | Warm, host-shared mount | 14.65 s | 12.81 s | 10.37 GiB |
 
-Both Parquet tables matched the previous version row for row on both datasets. The optimized image was faster in all three practice warm pairs and both cold pairs. On the cold runs the practice cgroup peak included about 1.91 GiB of file cache, with zero memory-limit events.
+Both Parquet tables matched the previous version row for row on both datasets. The optimized image was faster in both practice cold pairs, with a smaller difference between the warm medians. On the cold runs the practice cgroup peak included about 1.91 GiB of file cache, with zero memory-limit events.
 
 ## Pipeline
 
-- Workers align input chunks to newline boundaries in parallel. The C++ event decoder combines AVX2 delimiter scanning, CSV validation, ID encoding, and timestamp decoding in batches. It returns packed IDs or offsets into the original input for variable-width IDs. Union-find builds the identity lookup table while events are scanned. Click parsing starts as soon as that table is ready. The string table for long user and click IDs uses independently locked shards.
+- Workers align input chunks to newline boundaries in parallel. The C++ event decoder combines AVX2 delimiter scanning, CSV validation, ID encoding, and timestamp decoding in batches. It returns packed IDs or offsets into the original input for variable-width IDs. Union-find builds the identity lookup table while events are scanned. Click parsing starts as soon as that table is ready. Long user IDs use a sharded string table. Click IDs reference their exact bytes in the mapped CSV through attribution.
 - Workers store event payloads by person and partition 16-byte references by event ID. Deduplication compares long event IDs byte for byte when their hashes match, using the mapped CSV until the comparison finishes. The earliest copy wins, including when that copy fails validation. For rows parsed before identity links are ready, only surviving payloads whose canonical person falls in a different bucket need to move.
-- Counting and prefix sums group surviving rows by person. Workers reuse scatter buffers and schedule larger buckets first. They sort each person's history by timestamp, using radix sort for large event histories. A rolling click window tracks the crediting click and distinct assisting campaigns.
+- Counting and prefix sums group surviving rows by person. Workers reuse scatter buffers and schedule larger buckets first. They sort each person's events by timestamp, using radix sort for large histories. A single session can find its crediting click and distinct assisting campaigns in one pass. For multiple sessions, a rolling window uses clicks sorted by timestamp. Attribution compares click ID bytes only when qualifying timestamps tie.
 - Each worker streams user-day rows into Parquet. Campaign-day totals are merged across the workers.
 
 Production dependencies provide Parquet serialization and read-only memory mapping. [parquet-go](https://github.com/parquet-go/parquet-go) · [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)

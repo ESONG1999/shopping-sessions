@@ -402,21 +402,3 @@ func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
 	}
 	clear(s.blocks)
 }
-
-func readClicks(dir string, workers int, w window, ids *identities, a aliases, cat catalog) ([]partition[click], error) {
-	result := make([]partition[click], workers)
-	decoders := make([]timestampDecoder, workers)
-	err := scanParts(dir, workers, 4, func(worker int, f []string) {
-		if f[0] == "" || f[1] == "" {
-			return
-		}
-		ts, ok := decoders[worker].timestamp(f[3])
-		campaign := cat.campaignIDs[f[2]]
-		if !ok || ts < w.start-clickLookback || ts >= w.end || campaign == 0 {
-			return
-		}
-		person := a.personHash(ids.key(f[1]))
-		result[worker].add(person&(bucketCount-1), click{person, touchpoint{ts, ids.key(f[0]), campaign}})
-	})
-	return result, err
-}
