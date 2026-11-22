@@ -29,8 +29,8 @@ func TestDedupKeepsDistinctIDsWithTheSameHashSlot(t *testing.T) {
 	add := func(lane int, key, person uint64, ingest, ts int64) {
 		input.lanes[lane].add(inputEvent{key: key, user: person, ingest: ingest, activity: activity{ts: ts}}, input.base)
 	}
-	// The keys start in the same slot. A far-earlier, invalid duplicate
-	// suppresses its valid copy, even when it came from another worker.
+	// The keys have the same starting slot and fingerprint. An early invalid
+	// duplicate suppresses its valid copy, even across workers.
 	const one = uint64(1)
 	const two = one | 1<<40
 	const three = one | 2<<40

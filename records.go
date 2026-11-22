@@ -327,17 +327,7 @@ type eventKeyBlock struct {
 
 type dedupScratch struct {
 	blocks []eventKeyBlock
-	refs   []uint32
-	slots  []uint64
-}
-
-func clearWords(values []uint64, size int) []uint64 {
-	if cap(values) < size {
-		return make([]uint64, size)
-	}
-	values = values[:size]
-	clear(values)
-	return values
+	slots  []uint32
 }
 
 func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
@@ -356,27 +346,37 @@ func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
 		return
 	}
 	capacity := 1 << bits.Len(uint(4*size-1))
-	s.slots = clearWords(s.slots, capacity)
-	if cap(s.refs) < capacity {
-		s.refs = make([]uint32, capacity)
+	if cap(s.slots) < capacity {
+		s.slots = make([]uint32, capacity)
+	} else {
+		s.slots = s.slots[:capacity]
+		clear(s.slots)
 	}
-	refs := s.refs[:capacity]
+	// The low bits point to a row (plus one, reserving zero for an empty
+	// slot). The remaining high bits screen probes before reading that row.
+	// Only the full key and original ID bytes can establish equality.
+	refBits := bits.Len(uint(len(s.blocks) * blockSize))
+	fingerprintMask := ^uint32(0) << refBits
 	mask := capacity - 1
 	for blockNo, block := range s.blocks {
 		for i, row := range block.rows {
-			ref := uint32(blockNo*blockSize + i)
+			fingerprint := uint32(row.key>>32) & fingerprintMask
+			ref := fingerprint | uint32(blockNo*blockSize+i+1)
 			slot := int(row.key>>bucketBits) & mask
 			for {
 				previous := s.slots[slot]
 				if previous == 0 {
-					s.slots[slot] = row.key
-					refs[slot] = ref
+					s.slots[slot] = ref
 					break
 				}
-				if previous == row.key {
-					old := refs[slot]
+				if previous&fingerprintMask == fingerprint {
+					old := (previous &^ fingerprintMask) - 1
 					oldBlock := s.blocks[old/blockSize]
 					earlier := oldBlock.rows[old%blockSize]
+					if earlier.key != row.key {
+						slot = (slot + 1) & mask
+						continue
+					}
 					t, last := uint32(row.timeRef>>32), uint32(earlier.timeRef>>32)
 					replace := t < last
 					if (t|last)&extendedEvent != 0 {
@@ -389,7 +389,7 @@ func (s *dedupScratch) dedup(raw *eventInput, bucket int) {
 						replace = current.ingest < prior.ingest
 					}
 					if replace {
-						refs[slot] = ref
+						s.slots[slot] = ref
 						oldBlock.lane.discard(uint32(earlier.timeRef))
 					} else {
 						block.lane.discard(uint32(row.timeRef))

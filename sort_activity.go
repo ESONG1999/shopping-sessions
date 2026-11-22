@@ -8,7 +8,7 @@ import (
 
 func (agg *aggregator) sortActivity(rows []activity) []activity {
 	if len(rows) < 4096 {
-		slices.SortFunc(rows, func(a, b activity) int { return cmp.Compare(a.ts, b.ts) })
+		sortSmallActivity(rows, 2*bits.Len(uint(len(rows))))
 		return rows
 	}
 	// Heavy users benefit from radix passes over the active timestamp
@@ -47,4 +47,48 @@ func (agg *aggregator) sortActivity(rows []activity) []activity {
 		src, dst = dst, src
 	}
 	return src
+}
+
+// Keep timestamp comparisons inline for the histories that fit in cache.
+func sortSmallActivity(rows []activity, depth int) {
+	for len(rows) > 16 {
+		if depth == 0 {
+			slices.SortFunc(rows, func(a, b activity) int { return cmp.Compare(a.ts, b.ts) })
+			return
+		}
+		depth--
+		a, b, c := rows[0].ts, rows[len(rows)/2].ts, rows[len(rows)-1].ts
+		pivot := max(min(a, b), min(max(a, b), c))
+		left, right := 0, len(rows)-1
+		for left <= right {
+			for rows[left].ts < pivot {
+				left++
+			}
+			for rows[right].ts > pivot {
+				right--
+			}
+			if left <= right {
+				rows[left], rows[right] = rows[right], rows[left]
+				left++
+				right--
+			}
+		}
+		// Recurse on the smaller side to bound stack use.
+		if right+1 < len(rows)-left {
+			sortSmallActivity(rows[:right+1], depth)
+			rows = rows[left:]
+		} else {
+			sortSmallActivity(rows[left:], depth)
+			rows = rows[:right+1]
+		}
+	}
+	for i := 1; i < len(rows); i++ {
+		row := rows[i]
+		j := i
+		for j > 0 && rows[j-1].ts > row.ts {
+			rows[j] = rows[j-1]
+			j--
+		}
+		rows[j] = row
+	}
 }
